@@ -1,0 +1,57 @@
+import subprocess
+
+
+def git_status() -> tuple[int, str]:
+    """Run git status and return (exit_code, output)."""
+    try:
+        result = subprocess.run(
+            ["git", "status", "--short", "--branch"],
+            capture_output=True, text=True,
+        )
+        return result.returncode, result.stdout.strip()
+    except FileNotFoundError:
+        return 1, "git not found"
+
+
+def git_undo_last_commit() -> tuple[int, str]:
+    """Soft-reset the last commit, keeping changes staged.
+
+    Returns (exit_code, message).
+    """
+    try:
+        # Check there's at least one commit
+        check = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True,
+        )
+        if check.returncode != 0:
+            return 1, "No commits to undo."
+
+        # Get the commit message we're about to undo
+        log = subprocess.run(
+            ["git", "log", "--oneline", "-1"],
+            capture_output=True, text=True,
+        )
+        commit_msg = log.stdout.strip()
+
+        result = subprocess.run(
+            ["git", "reset", "--soft", "HEAD~1"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            return 0, f"Undid commit: {commit_msg}\nChanges are now staged."
+        return result.returncode, result.stderr.strip()
+    except FileNotFoundError:
+        return 1, "git not found"
+
+
+def git_diff_stat() -> tuple[int, str]:
+    """Show a short diff stat of uncommitted changes."""
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--stat"],
+            capture_output=True, text=True,
+        )
+        return result.returncode, result.stdout.strip()
+    except FileNotFoundError:
+        return 1, "git not found"

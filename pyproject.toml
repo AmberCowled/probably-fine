@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "probablyfine"
+version = "0.1.0"
+description = "Terminal AI coding agent with multi-model routing via Aider + Ollama"
+requires-python = ">=3.10"
+dependencies = [
+    "aider-chat",
+    "ollama",
+    "rich",
+    "tomli; python_version < '3.11'",
+]
+
+[project.scripts]
+probablyfine = "probablyfine.cli:main"
