@@ -1,3 +1,4 @@
+import argparse
 import subprocess
 import sys
 from pathlib import Path
@@ -7,10 +8,11 @@ from rich.theme import Theme
 
 from probablyfine import __version__
 from probablyfine.aider_session import run_aider
-from probablyfine.config import get_default_mode, get_model_map, load_config
+from probablyfine.config import get_dark_mode, get_default_mode, get_model_map, load_config
 from probablyfine.context import FileContext
-from probablyfine.git_utils import git_diff_stat, git_status, git_undo_last_commit
+from probablyfine.git_utils import git_branch_status, git_diff_stat, git_status, git_undo_last_commit
 from probablyfine.modes import MODE_DESCRIPTIONS, Mode
+from probablyfine.router import classify_task
 
 theme = Theme({
     "mode.fast": "bold green",
@@ -37,8 +39,14 @@ def check_git_repo() -> bool:
         return False
 
 
+def model_display(mode: Mode, model_map: dict[str, str]) -> str:
+    if mode == Mode.AUTO:
+        return "auto-selects per task"
+    return model_map.get(mode.value, "unknown")
+
+
 def print_banner(mode: Mode, model_map: dict[str, str]):
-    model = model_map.get(mode.value, "unknown")
+    model = model_display(mode, model_map)
     console.print(f"\n  [banner]PROBABLYFINE[/banner] v{__version__}", highlight=False)
     console.print(f"  Mode: [{f'mode.{mode.value}'}]{mode.value.upper()}[/] ({model})")
     console.print(f"  [info]Type a task, or /help for commands.[/info]\n")
@@ -58,6 +66,10 @@ def print_help():
     console.print("  /help              Show this help")
     console.print("  /quit, /exit       Exit probablyfine")
     console.print()
+    console.print("  [bold]Hotkeys:[/bold]")
+    console.print("  Ctrl+N             Next mode")
+    console.print("  Ctrl+P             Previous mode")
+    console.print()
     console.print("  [bold]Modes:[/bold]")
     for m in Mode:
         console.print(f"  {m.value:<12} {MODE_DESCRIPTIONS[m]}")
@@ -72,7 +84,7 @@ def get_prompt(mode: Mode, file_count: int = 0) -> str:
 def handle_mode_command(args: str, current_mode: Mode, model_map: dict[str, str]) -> Mode:
     """Handle /mode command. Returns the (possibly new) mode."""
     if not args:
-        model = model_map.get(current_mode.value, "unknown")
+        model = model_display(current_mode, model_map)
         console.print(f"  Current mode: [{f'mode.{current_mode.value}'}]{current_mode.value.upper()}[/] ({model})")
         return current_mode
 
@@ -84,19 +96,26 @@ def handle_mode_command(args: str, current_mode: Mode, model_map: dict[str, str]
         console.print(f"  [err]Unknown mode: {target}[/err]. Valid modes: {valid}")
         return current_mode
 
-    model = model_map.get(new_mode.value, "n/a (auto-selects)")
+    model = model_display(new_mode, model_map)
     console.print(f"  Switched to [{f'mode.{new_mode.value}'}]{new_mode.value.upper()}[/] ({model})")
     return new_mode
 
 
-def resolve_model(mode: Mode, model_map: dict[str, str]) -> str:
+def resolve_model(mode: Mode, model_map: dict[str, str], task: str = "") -> str:
     """Resolve the Ollama model name for the current mode.
 
-    In AUTO mode, falls back to DAILY for now (Phase 3 adds classifier).
+    In AUTO mode, classifies the task and routes to the best model.
     """
     if mode == Mode.AUTO:
-        console.print("  [mode.auto]AUTO → routing to DAILY (classifier not yet built)[/mode.auto]")
-        return model_map["daily"]
+        fast_model = model_map["fast"]
+        classified_mode, reason = classify_task(task, fast_model)
+        model = model_map[classified_mode.value]
+        style = f"mode.{classified_mode.value}"
+        console.print(
+            f"  [mode.auto]AUTO[/mode.auto] → [{style}]{classified_mode.value.upper()}[/{style}]"
+            f" ({reason}) → {model}"
+        )
+        return model
     return model_map[mode.value]
 
 
@@ -172,7 +191,26 @@ def handle_undo():
         console.print(f"  {output}")
 
 
+def _read_input_simple(mode: Mode, file_count: int) -> str:
+    """Fallback input using rich console (no hotkeys)."""
+    prompt = get_prompt(mode, file_count)
+    return console.input(prompt)
+
+
+def _make_tui_session(state):
+    """Create prompt_toolkit session. Returns (session, state) or None on import failure."""
+    try:
+        from probablyfine.tui import AppState, create_session
+        return create_session(state)
+    except ImportError:
+        return None
+
+
 def main():
+    parser = argparse.ArgumentParser(description="PROBABLYFINE - AI coding agent")
+    parser.add_argument("--simple", action="store_true", help="Disable TUI (no hotkeys, no toolbar)")
+    args = parser.parse_args()
+
     config = load_config()
     model_map = get_model_map(config)
     default = get_default_mode(config)
@@ -184,15 +222,44 @@ def main():
 
     ctx = FileContext()
 
+    # Set up TUI or simple mode
+    use_tui = not args.simple
+    tui_session = None
+    state = None
+
+    if use_tui:
+        try:
+            from probablyfine.tui import AppState, create_session
+            state = AppState(
+                mode=current_mode,
+                model_map=model_map,
+                file_count_fn=lambda: ctx.count,
+                git_branch_fn=git_branch_status,
+            )
+            tui_session = create_session(state)
+        except ImportError:
+            console.print("  [warn]prompt_toolkit not available, using simple mode.[/warn]")
+            use_tui = False
+        except Exception:
+            # prompt_toolkit fails on non-TTY (piped input, some Windows terminals)
+            console.print("  [warn]TUI unavailable for this terminal, using simple mode.[/warn]")
+            use_tui = False
+
     if not check_git_repo():
         console.print("  [warn]Warning: Not inside a git repository. Aider works best in a git repo.[/warn]")
 
     print_banner(current_mode, model_map)
 
     while True:
+        # Sync mode from TUI state (hotkeys may have changed it)
+        if state is not None:
+            current_mode = state.mode
+
         try:
-            prompt = get_prompt(current_mode, ctx.count)
-            task = console.input(prompt)
+            if use_tui and tui_session is not None:
+                task = tui_session.prompt()
+            else:
+                task = _read_input_simple(current_mode, ctx.count)
         except (EOFError, KeyboardInterrupt):
             console.print("\n  Goodbye.")
             break
@@ -205,7 +272,7 @@ def main():
         if task.startswith("/"):
             parts = task.split(maxsplit=1)
             cmd = parts[0].lower()
-            args = parts[1] if len(parts) > 1 else ""
+            cmd_args = parts[1] if len(parts) > 1 else ""
 
             if cmd in ("/quit", "/exit"):
                 console.print("  Goodbye.")
@@ -213,11 +280,13 @@ def main():
             elif cmd == "/help":
                 print_help()
             elif cmd == "/mode":
-                current_mode = handle_mode_command(args, current_mode, model_map)
+                current_mode = handle_mode_command(cmd_args, current_mode, model_map)
+                if state is not None:
+                    state.mode = current_mode
             elif cmd == "/add":
-                handle_add(args, ctx)
+                handle_add(cmd_args, ctx)
             elif cmd == "/drop":
-                handle_drop(args, ctx)
+                handle_drop(cmd_args, ctx)
             elif cmd == "/files":
                 handle_files(ctx)
             elif cmd == "/clear":
@@ -233,11 +302,12 @@ def main():
             continue
 
         # Run task through Aider
-        model = resolve_model(current_mode, model_map)
+        model = resolve_model(current_mode, model_map, task=task)
         files = ctx.files if ctx.count > 0 else None
         file_info = f" with {ctx.count} file(s)" if files else ""
         console.print(f"  [info]Sending to {model}{file_info}...[/info]")
-        exit_code = run_aider(model=model, message=task, files=files)
+        dark_mode = get_dark_mode(config)
+        exit_code = run_aider(model=model, message=task, files=files, dark_mode=dark_mode)
 
         if exit_code != 0 and exit_code != 130:
             console.print(f"  [err]Aider exited with code {exit_code}[/err]")

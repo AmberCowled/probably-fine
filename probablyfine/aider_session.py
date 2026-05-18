@@ -1,6 +1,9 @@
+import os
 import shutil
 import subprocess
 import sys
+
+OLLAMA_API_BASE = "http://localhost:11434"
 
 
 def find_aider() -> str | None:
@@ -8,11 +11,19 @@ def find_aider() -> str | None:
     return shutil.which("aider")
 
 
+def _build_env() -> dict[str, str]:
+    """Build environment with OLLAMA_API_BASE set."""
+    env = os.environ.copy()
+    env.setdefault("OLLAMA_API_BASE", OLLAMA_API_BASE)
+    return env
+
+
 def run_aider(
     model: str,
     message: str,
     files: list[str] | None = None,
     auto_commit: bool = False,
+    dark_mode: bool = True,
 ) -> int:
     """
     Run an Aider session as a subprocess.
@@ -27,8 +38,12 @@ def run_aider(
     cmd = [
         aider_path,
         "--model", f"ollama_chat/{model}",
+        "--no-show-model-warnings",
         "--message", message,
     ]
+
+    if dark_mode:
+        cmd.append("--dark-mode")
 
     if not auto_commit:
         cmd.append("--no-auto-commits")
@@ -38,7 +53,10 @@ def run_aider(
             cmd.extend(["--file", f])
 
     try:
-        result = subprocess.run(cmd, stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr)
+        result = subprocess.run(
+            cmd, stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr,
+            env=_build_env(),
+        )
         return result.returncode
     except KeyboardInterrupt:
         print("\nAider session interrupted.")

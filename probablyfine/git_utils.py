@@ -63,3 +63,28 @@ def git_diff_stat() -> tuple[int, str]:
         return result.returncode, result.stdout.strip()
     except FileNotFoundError:
         return 1, "git not found"
+
+
+def git_branch_status() -> tuple[str, bool]:
+    """Return (branch_name, is_dirty) cheaply for toolbar display.
+
+    Returns ("", False) if not in a git repo or git is unavailable.
+    """
+    try:
+        branch_result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if branch_result.returncode != 0:
+            return ("", False)
+        branch = branch_result.stdout.strip()
+
+        dirty_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, timeout=2,
+        )
+        is_dirty = bool(dirty_result.stdout.strip())
+
+        return (branch, is_dirty)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ("", False)

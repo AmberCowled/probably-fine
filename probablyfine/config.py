@@ -18,6 +18,7 @@ planning = "qwen3:32b"
 [defaults]
 mode = "daily"
 auto_commit = false
+dark_mode = true
 """
 
 
@@ -42,3 +43,7 @@ def get_model_map(config: dict) -> dict[str, str]:
 
 def get_default_mode(config: dict) -> str:
     return config.get("defaults", {}).get("mode", "daily")
+
+
+def get_dark_mode(config: dict) -> bool:
+    return config.get("defaults", {}).get("dark_mode", True)
