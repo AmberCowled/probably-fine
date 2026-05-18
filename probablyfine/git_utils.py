@@ -27,6 +27,14 @@ def git_undo_last_commit() -> tuple[int, str]:
         if check.returncode != 0:
             return 1, "No commits to undo."
 
+        # Check this isn't the root commit (HEAD~1 won't exist)
+        parent_check = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD~1"],
+            capture_output=True, text=True,
+        )
+        if parent_check.returncode != 0:
+            return 1, "Cannot undo: this is the first commit in the repository."
+
         # Get the commit message we're about to undo
         log = subprocess.run(
             ["git", "log", "--oneline", "-1"],
