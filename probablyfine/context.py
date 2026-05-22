@@ -1,20 +1,16 @@
 import glob
 from pathlib import Path
 
-from rich.console import Console
-
-console = Console()
-
 
 class FileContext:
-    """Tracks which files are included in Aider context."""
+    """Tracks which files are included in agent context."""
 
     def __init__(self):
         self._files: list[Path] = []
 
     @property
     def files(self) -> list[str]:
-        """Return file paths as strings for passing to Aider."""
+        """Return file paths as strings for passing to the agent."""
         return [str(f) for f in self._files]
 
     @property
