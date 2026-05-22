@@ -1,10 +1,10 @@
-# Getting Started with PROBABLYFINE
+# PROBABLYFINE
 
-PROBABLYFINE is a terminal AI coding assistant that routes tasks to local Ollama models through Aider. It gives you mode-based model selection, keyboard-driven switching, and git-aware code editing — all running locally.
+A terminal AI coding assistant that runs entirely on local Ollama models. Routes tasks through a custom agent with streaming edits, a maker-checker reflection loop, and dynamic VRAM management — all on a single 8GB GPU.
 
 ## Prerequisites
 
-- **Python 3.10+**
+- **Python 3.12+**
 - **Git** installed and available on PATH
 - **Ollama** installed and running ([ollama.com](https://ollama.com))
 - **8GB+ VRAM GPU** recommended (CPU inference works but is slow)
@@ -61,7 +61,7 @@ pipx install -e . --force
 If you prefer a standard virtual environment:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/probably-fine.git
+git clone https://github.com/AmberCowled/probably-fine.git
 cd probably-fine
 python -m venv .venv
 ```
@@ -112,7 +112,39 @@ You'll see:
 [daily] probablyfine>
 ```
 
-## 4. Modes
+## 4. How It Works
+
+Type a coding task and press Enter. PROBABLYFINE interprets your request, selects relevant files, streams edits from the model, and applies them directly to your codebase:
+
+```
+[daily] probablyfine> add input validation to the signup form
+  Interpreting task...
+  Intent: feature | Complexity: 2 | Clarity: 95%
+  Selected 3 files automatically
+  Step 1/2: [edit] Add validation logic to signup handler
+    ✓ Applied 4 edits to src/auth.py
+  Step 2/2: [verify] Run linter
+    OK
+```
+
+All edits are tracked by git with automatic checkpointing. Use `/undo` to roll back.
+
+### The Agent Pipeline
+
+1. **Interpreter** — classifies your task (bug fix, feature, refactor, question), assesses complexity, and decomposes it into ordered steps
+2. **File Selector** — uses keyword matching + LLM to pick which files the agent needs
+3. **Agent** — streams Ollama responses, parses SEARCH/REPLACE edit blocks, applies them atomically with 3-tier error recovery
+4. **Reflection** (optional) — a maker-checker loop where a second model reviews the diff and requests fixes if needed
+
+### 3-Tier Error Recovery
+
+When an edit fails to apply, the agent tries progressively harder recovery:
+
+1. **Tier 1** — exact SEARCH/REPLACE match
+2. **Tier 2** — retry with error context (tells the model what went wrong, asks for corrected edit)
+3. **Tier 3** — whole-file fallback (sends the entire file, asks for complete replacement)
+
+## 5. Modes
 
 PROBABLYFINE has four modes, each mapped to a different model:
 
@@ -137,20 +169,31 @@ Or use hotkeys (when the TUI toolbar is active):
 - **Ctrl+N** — next mode
 - **Ctrl+P** — previous mode
 
-## 5. Basic Usage
+## 6. Reflection (Maker-Checker)
 
-Type a coding task and press Enter. PROBABLYFINE sends it to Aider with the active model, which edits your files directly:
+When enabled, PROBABLYFINE runs a review loop after the agent makes changes:
+
+1. The **maker** model generates edits
+2. The **checker** model reviews the diff for bugs, logic errors, and style issues
+3. If the checker finds problems, the maker gets another pass to fix them
+4. Repeats up to 2 iterations or until the checker passes
+
+Toggle reflection:
 
 ```
-[daily] probablyfine> add input validation to the signup form
-  Sending to qwen3:8b...
+/reflect on        Always reflect
+/reflect off       Never reflect
+/reflect auto      Reflect based on diff size and task complexity (default)
 ```
 
-Aider applies changes to your repo. All edits are tracked by git.
+Auto mode triggers reflection when:
+- The diff is large (>30 lines changed)
+- The deletion ratio is suspicious (>3:1 deletions to additions)
+- The task involves complex keywords (refactor, security, auth, etc.)
+
+## 7. Commands
 
 ### File Context
-
-Control which files Aider sees:
 
 ```
 /add src/auth.py          Add a file to context
@@ -160,13 +203,7 @@ Control which files Aider sees:
 /clear                    Remove all files from context
 ```
 
-The prompt shows your file count:
-
-```
-[daily] (3 files) probablyfine>
-```
-
-### Git Commands
+### Git
 
 ```
 /git                      Show git status
@@ -174,32 +211,27 @@ The prompt shows your file count:
 /undo                     Soft-reset the last commit (keeps changes staged)
 ```
 
-### Other Commands
+### DRM (Dynamic Resource Manager)
+
+```
+/drm                      Toggle DRM on/off
+/drm on                   Enable DRM
+/drm off                  Disable DRM
+/drm status               Show VRAM usage, loaded models, swap stats
+```
+
+The DRM monitors GPU VRAM, manages model loading/unloading, detects OOM errors, and automatically falls back to smaller models when needed.
+
+### Other
 
 ```
 /mode                     Show current mode and model
+/reflect                  Toggle reflection mode
 /help                     Show all commands and hotkeys
 /quit                     Exit (also: /exit, Ctrl+C, Ctrl+D)
 ```
 
-## 6. AUTO Mode
-
-When set to AUTO, PROBABLYFINE classifies your task before routing it:
-
-```
-[auto] probablyfine> design a caching layer for the API
-  AUTO → PLANNING (keyword match) → qwen3:8b
-  Sending to qwen3:8b...
-```
-
-Classification uses a two-step approach:
-1. **Keyword matching** — instant, catches obvious cases ("fix typo" → FAST, "design" → PLANNING)
-2. **Model classification** — if no keyword match, asks qwen3:8b to classify (better reasoning than the fast model)
-3. **Fallback** — if both fail, defaults to DAILY
-
-You can always override by switching mode manually.
-
-## 7. Configuration
+## 8. Configuration
 
 On first run, a config file is created at `~/.probablyfine/config.toml`:
 
@@ -211,15 +243,23 @@ planning = "qwen3:8b"
 
 [defaults]
 mode = "daily"
-auto_commit = false
+dark_mode = true
+
+[reflection]
+enabled = true
+mode = "auto"
+
+[drm]
+enabled = true
 ```
 
 Edit this file to:
 - Swap in different Ollama models
 - Change the default startup mode
-- Enable auto-commit (Aider commits changes automatically)
+- Configure reflection behavior
+- Set DRM preferences
 
-## 8. CLI Flags
+## 9. CLI Flags
 
 ```
 probablyfine              Launch with TUI (toolbar, hotkeys, tab completion)
@@ -228,22 +268,43 @@ probablyfine --simple     Launch without TUI (plain input, works everywhere)
 
 Use `--simple` if you have terminal compatibility issues or prefer a minimal interface.
 
+## Architecture
+
+```
+cli.py (REPL + commands)
+  → interpreter.py (classify intent, decompose into steps)
+  → agent.py (stream Ollama, parse SEARCH/REPLACE, apply edits)
+  → reflection.py (maker-checker review loop)
+     → checker.py (LLM code review with streaming)
+```
+
+Supporting modules:
+- `config.py` — TOML config from `~/.probablyfine/config.toml`
+- `models.py` — 15 dataclasses (Issue, CheckerResult, TaskPlan, StepContext, etc.)
+- `context.py` — FileContext tracking files in session
+- `router.py` — Task routing and mode classification
+- `modes.py` — Mode definitions (FAST / DAILY / PLANNING / AUTO)
+- `tui.py` — Terminal UI with prompt_toolkit, hotkeys, status bar
+- `file_selector.py` — LLM-powered file selection for tasks
+- `edit_parser.py` — SEARCH/REPLACE block parser with atomic apply
+- `ollama_utils.py` — Shared Ollama client, streaming, JSON parsing
+- `console.py` — Rich theme and console instance
+- `log_utils.py` — Logger factory
+- `drm/` — Dynamic Resource Manager (VRAM monitoring, model lifecycle, swap scheduling, health watchdog)
+
 ## Troubleshooting
-
-**pip install fails with "Could not install packages due to an OSError" (Windows)**
-This happens when pip tries to write to a system-wide `Scripts` folder without permission. Use a virtual environment (see step 2 above) to avoid this entirely. If you already installed without a venv, delete the stale `probablyfine.exe` from `C:\Python312\Scripts\` and reinstall with `pip install -e . --user`, or switch to a venv.
-
-**"aider not found"**
-Aider should be installed automatically. If not: `pip install aider-chat`
 
 **"Warning: Not inside a git repository"**
 PROBABLYFINE works best inside a git repo. Run `git init` first if needed.
 
 **Model is slow**
-On low VRAM, responses may be slow. Use FAST mode for quick tasks. Both models fit comfortably in ~6GB VRAM.
+On low VRAM, responses may be slow. Use FAST mode for quick tasks. Check `/drm status` for VRAM pressure.
 
 **TUI not showing / falling back to simple mode**
 This happens when stdin is piped or the terminal doesn't support prompt_toolkit. The `--simple` fallback works identically, just without hotkeys and toolbar.
 
 **Model not found**
 Make sure you've pulled the model: `ollama pull <model-name>`. Run `ollama list` to see what's available.
+
+**OOM / model stalls**
+The DRM detects OOM errors and automatically falls back to the fast model. If issues persist, try `/drm status` to check VRAM, or manually switch to FAST mode.
