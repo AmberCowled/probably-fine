@@ -1,6 +1,18 @@
 import subprocess
 
 
+def get_head_sha() -> str:
+    """Return current HEAD SHA, or empty string if unavailable."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+
+
 def git_status() -> tuple[int, str]:
     """Run git status and return (exit_code, output)."""
     try:

@@ -11,17 +11,14 @@ PROBABLYFINE is a terminal AI coding assistant that routes tasks to local Ollama
 
 ## 1. Install Ollama Models
 
-Pull the models PROBABLYFINE uses. You need at least one, but all three are recommended:
+Pull the models PROBABLYFINE uses:
 
 ```bash
-# Fast model — quick fixes, classification (required for AUTO mode)
+# Fast model — quick code edits, small fixes, execution tasks
 ollama pull deepseek-coder:6.7b
 
-# Daily model — general coding (default mode)
-ollama pull qwen3-coder:30b
-
-# Planning model — architecture and reasoning
-ollama pull qwen3:32b
+# Daily + Planning model — coding, reasoning, architecture, task classification
+ollama pull qwen3:8b
 ```
 
 Verify Ollama is running:
@@ -46,7 +43,7 @@ pipx ensurepath
 Then install PROBABLYFINE:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/probably-fine.git
+git clone https://github.com/AmberCowled/probably-fine.git
 cd probably-fine
 pipx install -e .
 ```
@@ -109,7 +106,7 @@ You'll see:
 
 ```
   PROBABLYFINE v0.1.0
-  Mode: DAILY (qwen3-coder:30b)
+  Mode: DAILY (qwen3:8b)
   Type a task, or /help for commands.
 
 [daily] probablyfine>
@@ -121,9 +118,9 @@ PROBABLYFINE has four modes, each mapped to a different model:
 
 | Mode | Model | Best for |
 |------|-------|----------|
-| **FAST** | deepseek-coder:6.7b | Quick fixes, typos, renaming, one-liners |
-| **DAILY** | qwen3-coder:30b | Implementation, features, refactoring, bug fixes |
-| **PLANNING** | qwen3:32b | Architecture, design, reasoning, trade-offs |
+| **FAST** | deepseek-coder:6.7b | Quick code edits, small fixes, execution tasks |
+| **DAILY** | qwen3:8b | Implementation, features, refactoring, bug fixes |
+| **PLANNING** | qwen3:8b | Architecture, design, reasoning, trade-offs |
 | **AUTO** | (selects per task) | Classifies your task and picks the best model |
 
 Switch modes with:
@@ -146,7 +143,7 @@ Type a coding task and press Enter. PROBABLYFINE sends it to Aider with the acti
 
 ```
 [daily] probablyfine> add input validation to the signup form
-  Sending to qwen3-coder:30b...
+  Sending to qwen3:8b...
 ```
 
 Aider applies changes to your repo. All edits are tracked by git.
@@ -191,13 +188,13 @@ When set to AUTO, PROBABLYFINE classifies your task before routing it:
 
 ```
 [auto] probablyfine> design a caching layer for the API
-  AUTO → PLANNING (keyword match) → qwen3:32b
-  Sending to qwen3:32b...
+  AUTO → PLANNING (keyword match) → qwen3:8b
+  Sending to qwen3:8b...
 ```
 
-Classification uses a fast two-step approach:
+Classification uses a two-step approach:
 1. **Keyword matching** — instant, catches obvious cases ("fix typo" → FAST, "design" → PLANNING)
-2. **Model classification** — if no keyword match, asks the FAST model to classify
+2. **Model classification** — if no keyword match, asks qwen3:8b to classify (better reasoning than the fast model)
 3. **Fallback** — if both fail, defaults to DAILY
 
 You can always override by switching mode manually.
@@ -209,8 +206,8 @@ On first run, a config file is created at `~/.probablyfine/config.toml`:
 ```toml
 [models]
 fast = "deepseek-coder:6.7b"
-daily = "qwen3-coder:30b"
-planning = "qwen3:32b"
+daily = "qwen3:8b"
+planning = "qwen3:8b"
 
 [defaults]
 mode = "daily"
@@ -242,8 +239,8 @@ Aider should be installed automatically. If not: `pip install aider-chat`
 **"Warning: Not inside a git repository"**
 PROBABLYFINE works best inside a git repo. Run `git init` first if needed.
 
-**30B model is very slow**
-On 8GB VRAM, the 30B models run but responses take 30-60s. Use FAST mode for quick tasks. Consider smaller model variants if speed is critical.
+**Model is slow**
+On low VRAM, responses may be slow. Use FAST mode for quick tasks. Both models fit comfortably in ~6GB VRAM.
 
 **TUI not showing / falling back to simple mode**
 This happens when stdin is piped or the terminal doesn't support prompt_toolkit. The `--simple` fallback works identically, just without hotkeys and toolbar.
