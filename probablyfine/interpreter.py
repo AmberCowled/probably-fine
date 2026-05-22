@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import time
@@ -37,8 +38,9 @@ CLARITY_THRESHOLD = 0.7
 CLASSIFY_TIMEOUT = 30       # seconds (extra margin for thinking tokens + structured questions)
 CLASSIFY_NUM_PREDICT = 800  # tokens (thinking tokens + structured clarification questions)
 DECOMPOSE_TIMEOUT = 60      # seconds (thinking mode needs more time on complex prompts)
-DECOMPOSE_NUM_PREDICT = 2000 # tokens (thinking overhead + 6-step JSON plan + safety margin)
-MAX_DECOMPOSITION_STEPS = 6  # cap runaway decomposition
+DECOMPOSE_NUM_PREDICT = 2000 # tokens (6-step JSON plan + safety margin)
+DECOMPOSE_THINKING_NUM_PREDICT = 3000  # tokens (with thinking enabled for complex tasks)
+MAX_DECOMPOSITION_STEPS = 10  # absolute maximum (complexity 3 cap)
 
 # ---------------------------------------------------------------------------
 # Prompt templates
@@ -74,6 +76,13 @@ Clarity: How clear and actionable the request is (1.0 = perfectly clear, 0.0 = c
 If clarity < 0.7, provide 1-2 clarification questions with 2-4 suggested answer options each.
 Otherwise leave clarification_questions as an empty list.
 
+Examples:
+Task: "Fix the NameError on line 42 of cli.py where get_config is undefined"
+{{"intent":"bug_fix","complexity":1,"clarity":1.0,"clarification_questions":[]}}
+
+Task: "Refactor the authentication module to use dependency injection across all handlers"
+{{"intent":"refactor","complexity":3,"clarity":0.9,"clarification_questions":[]}}
+
 Task: {task}
 
 JSON: /no_think"""
@@ -102,16 +111,21 @@ Rules:
 - Use "create" for new files
 - Use "verify" for running tests or linting
 - Use "explain" for answering questions (no file changes)
-- Keep the total number of steps between 2 and 6
+- Keep the total number of steps between 2 and {max_steps}
 - List file dependencies with depends_on (step IDs that must complete first)
 - You MUST populate the files array for every edit/create/delete step using paths from the available files list below
 - If no files are listed or you need a file not in the list, leave the files array empty for that step
+
+Example:
+Task: "Add a timeout parameter to the fetch_data function in api.py"
+Intent: feature
+{{"reasoning":"Add timeout param to function signature and pass it to the HTTP call","steps":[{{"id":1,"action":"read","description":"Read api.py to understand fetch_data signature","files":["api.py"],"depends_on":[]}},{{"id":2,"action":"edit","description":"Add timeout parameter to fetch_data and pass to requests.get","files":["api.py"],"depends_on":[1]}},{{"id":3,"action":"edit","description":"Update callers of fetch_data to pass timeout","files":["main.py"],"depends_on":[2]}}]}}
 
 Task: {task}
 Intent: {intent}
 {file_context}
 
-JSON: /no_think"""
+JSON:{thinking_suffix}"""
 
 # ---------------------------------------------------------------------------
 # Keyword patterns (fast path -- no LLM call needed)
@@ -303,6 +317,59 @@ def _build_file_summary(file_context: list[str] | None, max_entries: int = 30) -
     return "Available files:\n" + "\n".join(entries)
 
 
+def _build_codebase_summary(file_context: list[str] | None, max_symbols: int = 50) -> str:
+    """Extract function/class names from Python files via ast for the decompose prompt.
+
+    Returns a compact string like:
+        Available symbols:
+          agent.py: execute_step, execute_plan, _retry_with_error_context
+          models.py: Issue, CheckerResult, TaskPlan
+    Or empty string if no symbols found.
+    """
+    if not file_context:
+        return ""
+
+    total = 0
+    entries: list[str] = []
+    for fpath in file_context:
+        if total >= max_symbols:
+            break
+        if not fpath.endswith(".py"):
+            continue
+        p = Path(fpath)
+        if not p.exists():
+            continue
+        try:
+            source = p.read_text(errors="replace")
+            tree = ast.parse(source, filename=fpath)
+        except (SyntaxError, OSError):
+            continue
+
+        symbols: list[str] = []
+        for node in ast.iter_child_nodes(tree):
+            if total + len(symbols) >= max_symbols:
+                break
+            if isinstance(node, ast.FunctionDef):
+                symbols.append(node.name)
+            elif isinstance(node, ast.ClassDef):
+                symbols.append(node.name)
+
+        if symbols:
+            total += len(symbols)
+            entries.append(f"  {fpath}: {', '.join(symbols)}")
+
+    if not entries:
+        return ""
+    return "Available symbols:\n" + "\n".join(entries)
+
+
+def _get_step_budget(complexity: int, task_len: int = 0) -> int:
+    """Return maximum step count based on task complexity and length."""
+    base = {1: 3, 2: 6, 3: 10}.get(complexity, 6)
+    bonus = min(task_len // 100, 2)  # +1 per 100 chars, max +2
+    return min(base + bonus, MAX_DECOMPOSITION_STEPS)
+
+
 def _classify_intent_keywords(task: str) -> str | None:
     """Classify intent via keyword patterns. Returns None if no match."""
     lower = task.lower()
@@ -481,14 +548,22 @@ def _decompose_task(
     intent: str,
     model: str,
     file_context: str = "",
+    max_steps: int = 6,
+    use_thinking: bool = False,
 ) -> dict | None:
     """Decompose task into steps via LLM. Returns parsed dict or None."""
+    thinking_suffix = "" if use_thinking else " /no_think"
+    num_predict = DECOMPOSE_THINKING_NUM_PREDICT if use_thinking else DECOMPOSE_NUM_PREDICT
+    if use_thinking:
+        log.info("[decompose] Thinking enabled (complexity 3), num_predict=%d", num_predict)
     prompt = DECOMPOSE_PROMPT.format(
+        max_steps=max_steps,
         task=task,
         intent=intent,
         file_context=file_context or "(no files specified)",
+        thinking_suffix=thinking_suffix,
     ) + get_prompt_suffix(model, "decompose")
-    result = _call_llm(prompt, model, "decompose", DECOMPOSE_TIMEOUT, DECOMPOSE_NUM_PREDICT,
+    result = _call_llm(prompt, model, "decompose", DECOMPOSE_TIMEOUT, num_predict,
                        streaming=True)
     if result is not None:
         steps = result.get("steps", [])
@@ -650,6 +725,97 @@ def _build_single_step_plan(
     )
 
 
+# ---------------------------------------------------------------------------
+# Plan templates — skip LLM decompose for common patterns
+# ---------------------------------------------------------------------------
+
+# Each template: (keyword_sets, intent_filter, steps_factory)
+# keyword_sets: list of keyword sets — at least one set must fully match
+# intent_filter: required intent or None for any
+# steps_factory: callable(task) -> list[TaskStep]
+
+_PLAN_TEMPLATES: list[tuple[str, list[set[str]], str | None, callable]] = [
+    (
+        "add_import",
+        [{"add", "import"}, {"fix", "import"}, {"missing", "import"}],
+        None,
+        lambda task: [
+            TaskStep(id=1, action="read", description=f"Read file to find import section", files=[]),
+            TaskStep(id=2, action="edit", description=task, files=[], depends_on=[1]),
+        ],
+    ),
+    (
+        "rename_symbol",
+        [{"rename"}, {"change", "name"}],
+        "refactor",
+        lambda task: [
+            TaskStep(id=1, action="read", description=f"Read file to find all occurrences of the symbol", files=[]),
+            TaskStep(id=2, action="edit", description=task, files=[], depends_on=[1]),
+            TaskStep(id=3, action="verify", description="Verify syntax after rename", files=[], depends_on=[2]),
+        ],
+    ),
+    (
+        "add_config",
+        [{"add", "config"}, {"add", "setting"}, {"add", "option"}],
+        "feature",
+        lambda task: [
+            TaskStep(id=1, action="read", description="Read config.py to understand existing pattern", files=[]),
+            TaskStep(id=2, action="edit", description=f"Add to DEFAULT_CONFIG: {task}", files=[], depends_on=[1]),
+            TaskStep(id=3, action="edit", description=f"Add accessor function: {task}", files=[], depends_on=[2]),
+        ],
+    ),
+    (
+        "simple_bugfix",
+        [{"fix", "bug"}, {"fix", "error"}, {"fix", "crash"}, {"fix", "typo"}],
+        "bug_fix",
+        lambda task: [
+            TaskStep(id=1, action="read", description=f"Read file to locate the bug", files=[]),
+            TaskStep(id=2, action="edit", description=task, files=[], depends_on=[1]),
+            TaskStep(id=3, action="verify", description="Verify fix compiles", files=[], depends_on=[2]),
+        ],
+    ),
+    (
+        "add_function",
+        [{"add", "function"}, {"add", "method"}, {"create", "function"}, {"add", "helper"}],
+        "feature",
+        lambda task: [
+            TaskStep(id=1, action="read", description="Read file to understand existing code structure", files=[]),
+            TaskStep(id=2, action="edit", description=task, files=[], depends_on=[1]),
+        ],
+    ),
+    (
+        "add_constant",
+        [{"add", "constant"}, {"add", "default"}, {"add", "variable"}],
+        None,
+        lambda task: [
+            TaskStep(id=1, action="read", description="Read file to find constant definitions", files=[]),
+            TaskStep(id=2, action="edit", description=task, files=[], depends_on=[1]),
+        ],
+    ),
+]
+
+
+def _match_template(task: str, intent: str) -> tuple[str, list[TaskStep]] | None:
+    """Match task against plan templates using keyword heuristics.
+
+    Returns (template_name, steps) or None if no match.
+    """
+    task_words = set(re.findall(r'[a-z]+', task.lower()))
+
+    for name, keyword_sets, intent_filter, factory in _PLAN_TEMPLATES:
+        # Check intent filter
+        if intent_filter and intent != intent_filter:
+            continue
+        # Check if any keyword set is fully contained in task words
+        for kw_set in keyword_sets:
+            if kw_set <= task_words:
+                steps = factory(task)
+                log.info("Template match: %s (keywords=%s)", name, kw_set)
+                return name, steps
+
+    return None
+
+
 def _parse_steps(steps_data: list) -> list[TaskStep]:
     """Parse and validate step dicts from LLM output into TaskStep objects."""
     valid_actions = {"read", "edit", "create", "delete", "verify", "explain"}
@@ -767,14 +933,21 @@ def _decompose_and_parse(
     model: str,
     file_context: list[str] | None,
     _status: callable,
+    complexity: int = 2,
 ) -> tuple[list[TaskStep], str, str] | None:
     """Phase 4: Decompose task into steps via LLM, parse, and cap.
 
     Returns (steps, reasoning, raw_decomposition) or None on any failure.
     """
-    _status("decompose", "Breaking down task into steps...")
+    step_budget = _get_step_budget(complexity, len(task))
+    _status("decompose", f"Breaking down task into steps (max {step_budget})...")
     file_summary = _build_file_summary(file_context)
-    decomp_result = _decompose_task(task, intent, model, file_context=file_summary)
+    symbol_summary = _build_codebase_summary(file_context)
+    if symbol_summary:
+        file_summary = file_summary + "\n" + symbol_summary
+    use_thinking = complexity >= 3
+    decomp_result = _decompose_task(task, intent, model, file_context=file_summary,
+                                     max_steps=step_budget, use_thinking=use_thinking)
 
     if decomp_result is None:
         return None
@@ -789,10 +962,10 @@ def _decompose_and_parse(
     if not steps:
         return None
 
-    if len(steps) > MAX_DECOMPOSITION_STEPS:
+    if len(steps) > step_budget:
         log.warning("Decomposition produced %d steps, capping at %d",
-                     len(steps), MAX_DECOMPOSITION_STEPS)
-        steps = steps[:MAX_DECOMPOSITION_STEPS]
+                     len(steps), step_budget)
+        steps = steps[:step_budget]
 
     reasoning = str(decomp_result.get("reasoning", ""))
     return steps, reasoning, raw_decomposition
@@ -906,8 +1079,27 @@ def interpret_task(
             raw_classification=raw_classification,
         ))
 
+    # --- Phase 3b: Template fast path ---
+    template_match = _match_template(task, intent)
+    if template_match:
+        tmpl_name, tmpl_steps = template_match
+        _status("decompose", f"Using template: {tmpl_name}")
+        log.info("Skipping LLM decompose — template '%s' matched (%d steps)",
+                 tmpl_name, len(tmpl_steps))
+        return _finish(TaskPlan(
+            original_task=task,
+            intent=intent,
+            complexity=complexity,
+            clarity=clarity,
+            steps=tmpl_steps,
+            suggested_model=model,
+            reasoning=f"Template match: {tmpl_name}",
+            raw_classification=raw_classification,
+        ))
+
     # --- Phase 4: Decomposition ---
-    decomposed = _decompose_and_parse(task, intent, model, file_context, _status)
+    decomposed = _decompose_and_parse(task, intent, model, file_context, _status,
+                                       complexity=complexity)
     if decomposed is None:
         _status("done", "Decomposition failed, using fallback")
         plan = _build_fallback_plan(task, reason="decomposition failed")

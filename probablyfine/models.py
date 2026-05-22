@@ -19,6 +19,15 @@ class Issue:
     line: int | None = None
 
 
+# Checker failure mode constants
+CHECKER_OK = ""             # normal completion
+CHECKER_HANG = "hang"       # no tokens for 60s
+CHECKER_OOM = "oom"         # out of memory
+CHECKER_TIMEOUT = "timeout" # wall-clock timeout
+CHECKER_EMPTY = "empty"     # empty response
+CHECKER_PARSE_FAIL = "parse_fail"  # invalid JSON
+
+
 @dataclass
 class CheckerResult:
     verdict: str           # "PASS" | "FAIL" | "ESCALATE"
@@ -26,6 +35,7 @@ class CheckerResult:
     issues: list[Issue]
     summary: str
     raw_response: str = ""
+    failure_mode: str = ""  # one of CHECKER_* constants, empty = normal
 
 
 @dataclass
@@ -60,6 +70,14 @@ class CheckerRequest:
     iteration: int = 1
     max_iterations: int = 2
     timeout: float = 180
+
+
+# Edit error type constants (used by validate_edits and retry logic)
+EDIT_ERR_MULTI_MATCH = "multi_match"
+EDIT_ERR_NOT_FOUND = "not_found"
+EDIT_ERR_FILE_MISSING = "file_missing"
+EDIT_ERR_LINE_RANGE = "line_range"
+EDIT_ERR_GENERIC = "generic"
 
 
 @dataclass
@@ -174,6 +192,7 @@ class AgentConfig:
     test_command: str = ""
     num_ctx: int | None = None
     dark_mode: bool = True
+    max_whole_file_size_kb: int = 10
 
 
 @dataclass

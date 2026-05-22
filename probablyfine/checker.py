@@ -6,7 +6,16 @@ import sys
 import time
 
 from probablyfine.log_utils import get_module_logger
-from probablyfine.models import CheckerRequest, CheckerResult, Issue
+from probablyfine.models import (
+    CHECKER_EMPTY,
+    CHECKER_HANG,
+    CHECKER_OOM,
+    CHECKER_PARSE_FAIL,
+    CHECKER_TIMEOUT,
+    CheckerRequest,
+    CheckerResult,
+    Issue,
+)
 from probablyfine.ollama_utils import (
     HangDetected as _HangDetected,
     ZERO_TOKEN_ABORT_S as _ZERO_TOKEN_ABORT_S,
@@ -89,6 +98,52 @@ CHECKER_USER_TEMPLATE = """\
 This is review iteration {iteration} of maximum {max_iterations}.
 
 Review the diff above against the original task. Respond with JSON only."""
+
+
+def quick_sanity_check(changed_files: list[str] | None) -> CheckerResult | None:
+    """Fast pre-check: ast.parse changed Python files to catch syntax errors.
+
+    Returns a FAIL CheckerResult if any file has a syntax error,
+    or None if all files pass (caller should proceed to LLM checker).
+    """
+    if not changed_files:
+        return None
+
+    import ast
+    from pathlib import Path
+
+    issues = []
+    for fpath in changed_files:
+        if not fpath.endswith(".py"):
+            continue
+        p = Path(fpath)
+        if not p.exists():
+            continue
+        try:
+            source = p.read_text(errors="replace")
+            ast.parse(source, filename=fpath)
+        except SyntaxError as e:
+            log.info("Pre-checker caught syntax error in %s: %s", fpath, e)
+            issues.append(Issue(
+                severity="critical",
+                file=fpath,
+                description=f"Syntax error: {e.msg}",
+                suggestion=f"Fix syntax at line {e.lineno}" if e.lineno else "Fix the syntax error",
+                line=e.lineno,
+            ))
+        except OSError:
+            continue
+
+    if issues:
+        log.info("Pre-checker FAIL: %d syntax error(s) — skipping LLM review", len(issues))
+        return CheckerResult(
+            verdict="FAIL",
+            confidence=1.0,
+            issues=issues,
+            summary=f"Pre-checker caught {len(issues)} syntax error(s) — fix before review.",
+            raw_response="",
+        )
+    return None
 
 
 def _truncate_diff(diff: str) -> str:
@@ -239,6 +294,7 @@ def run_checker(req: CheckerRequest) -> CheckerResult:
             issues=[],
             summary="Checker hung (no tokens for 60s) -- accepting changes unchecked.",
             raw_response="",
+            failure_mode=CHECKER_HANG,
         )
     except Exception as e:
         _clear_progress()
@@ -252,6 +308,7 @@ def run_checker(req: CheckerRequest) -> CheckerResult:
             if result:
                 return result
 
+        is_oom = watchdog and watchdog.is_oom_error(e)
         log.exception("Checker error: %s", e)
         return CheckerResult(
             verdict="PASS",
@@ -259,6 +316,7 @@ def run_checker(req: CheckerRequest) -> CheckerResult:
             issues=[],
             summary=f"Checker error: {e} -- accepting changes unchecked.",
             raw_response="",
+            failure_mode=CHECKER_OOM if is_oom else CHECKER_HANG,
         )
 
 
@@ -319,6 +377,7 @@ def _run_checker_stream(
                 issues=[],
                 summary=f"Checker produced no tokens after {now - start:.0f}s -- accepting changes unchecked.",
                 raw_response="",
+                failure_mode=CHECKER_EMPTY,
             )
 
         # Wall-clock timeout: cap total generation time
@@ -331,6 +390,7 @@ def _run_checker_stream(
             if raw.strip():
                 result = _parse_response(raw)
                 result.summary = f"(timeout after {elapsed:.0f}s) {result.summary}"
+                result.failure_mode = CHECKER_TIMEOUT
                 return result
             return CheckerResult(
                 verdict="PASS",
@@ -338,6 +398,7 @@ def _run_checker_stream(
                 issues=[],
                 summary=f"Checker timed out after {elapsed:.0f}s -- accepting changes unchecked.",
                 raw_response=raw,
+                failure_mode=CHECKER_TIMEOUT,
             )
 
         content = _extract_content(chunk)
@@ -362,6 +423,7 @@ def _run_checker_stream(
             issues=[],
             summary="Checker returned empty response -- accepting changes.",
             raw_response=raw,
+            failure_mode=CHECKER_EMPTY,
         )
 
     result = _parse_response(raw)

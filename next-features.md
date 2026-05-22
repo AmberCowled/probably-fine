@@ -3,449 +3,463 @@
 ## Summary
 | Impact | Count | Top Pick |
 |--------|-------|----------|
-| High (4-5) | 8 | Few-Shot Edit Examples in System Prompt |
-| Medium (3) | 7 | Hallucination Validator Enhancement |
-| Low (1-2) | 3 | Dynamic num_predict by Step Type |
+| High (4-5) | 12 | Whole-File Fallback Size Guard |
+| Medium (3) | 8 | Stale Context Detection |
+| Low (1-2) | 0 | — |
 
-Total: 18 new features identified, 4 existing items referenced.
+Total: 17 new features identified, 3 existing items referenced.
 Categories analyzed: edit-accuracy, context-management, task-decomposition, error-recovery, prompt-engineering, token-efficiency, review-quality, multi-file-reasoning
 
 ## Features
 
-### 1. Few-Shot Edit Examples in System Prompt {IMPLEMENTED}
-> Implemented: Added 3 few-shot examples (edit, new file, multi-block) to AGENT_SYSTEM_PROMPT in agent.py. [2026-05-22]
-
-**Category:** prompt-engineering
-**Impact:** 5/5 — 8B models are dramatically more format-compliant when given concrete examples; logs show frequent SEARCH block mismatches that examples would prevent.
-**Effort:** XS — Add 2-3 canonical SEARCH/REPLACE examples to the agent system prompt in `agent.py`, ~15 lines.
-**Priority Score:** 25
-
-**The Gap:** Cloud models internalize edit formats from their training data and reliably produce well-formed SEARCH/REPLACE blocks. 8B models frequently emit malformed blocks — wrong delimiters, non-unique search text, or inverted search/replace sections. Few-shot examples in the system prompt are the single most effective way to compensate for smaller model capacity.
-
-**Proposed Approach:**
-- Add 2-3 example SEARCH/REPLACE blocks to the system prompt in `agent.py` showing exact format with `<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE` delimiters
-- Include one example of a CONTENT/END block for new files
-- Include one negative example showing a common mistake (e.g., using `---` instead of `=======`)
-- Place examples after the format description but before the task injection
-
-**Files Affected:**
-- `probablyfine/agent.py` — Add few-shot examples to system prompt constant
-
----
-
-### 2. Zero-Token Detection and Auto-Retry {IMPLEMENTED}
-> Implemented: Reduced _ZERO_TOKEN_ABORT_S from 30→15s in checker.py, added auto-retry with halved num_ctx on zero-token stall. Added _ZERO_TOKEN_ABORT_S=15 to agent.py streaming loop, raises _HangDetected for existing recovery. [2026-05-22]
-
+### 1. Whole-File Fallback Size Guard {IMPLEMENTED}
+> Implemented: Added _WHOLE_FILE_MAX_SIZE_KB constant and size check in _whole_file_fallback(), configurable via AgentConfig.max_whole_file_size_kb. [2026-05-22]
 **Category:** error-recovery
-**Impact:** 5/5 — Checker logs show 5/22 sessions (23%) producing zero tokens before the 120s timeout; this is the single largest source of wasted time.
-**Effort:** S — Add early detection in `_run_checker_stream()` and agent streaming, ~40 lines across 2 files.
+**Impact:** 4/5 — Prevents hallucination and truncation on large files, which is the most damaging Tier 3 failure mode.
+**Effort:** XS — ~15 lines, size check + early return in one function, new constant in AgentConfig.
 **Priority Score:** 20
 
-**The Gap:** Cloud APIs never stall silently — they either respond or return an error within seconds. Local Ollama models can stall indefinitely due to VRAM pressure, KV cache allocation failure, or model loading delays. The current 30s zero-token abort in `checker.py` helps but the agent has no equivalent, and 30s is still too long when the model is clearly stalled.
+**The Gap:** Cloud models handle large files by reasoning about structure; 8B models asked to regenerate a 10KB+ file often hallucinate functions or truncate mid-statement. Currently `_whole_file_fallback()` has no size limit at all.
 
 **Proposed Approach:**
-- Reduce `_ZERO_TOKEN_ABORT_S` in `checker.py` from 30 to 15 seconds
-- Add equivalent zero-token early abort to agent streaming in `agent.py`
-- On zero-token abort, automatically retry once with reduced `num_ctx` (halved) to relieve VRAM pressure
-- Log the stall event with VRAM snapshot from DRM for debugging
-- If retry also stalls, fall through to existing graceful degradation
+- Add `_WHOLE_FILE_MAX_SIZE_KB = 10` constant in `agent.py`
+- In `_whole_file_fallback()` (line ~560), check `Path(failed_file).stat().st_size / 1024` before attempting
+- If file exceeds limit, log warning and return None (skip Tier 3, let step fail gracefully)
+- Add `max_whole_file_size_kb` to `AgentConfig` in `models.py` for configurability
+- Log: "File too large for whole-file recovery (N KB) — skipping Tier 3"
 
 **Files Affected:**
-- `probablyfine/checker.py` — Reduce abort threshold, add auto-retry with reduced context
-- `probablyfine/agent.py` — Add zero-token detection to streaming loop
+- `probablyfine/agent.py` — add size check in `_whole_file_fallback()`
+- `probablyfine/models.py` — add field to `AgentConfig`
 
 ---
 
-### 3. Indentation-Aware Fuzzy Matching {IMPLEMENTED}
-> Implemented: Added _detect_indent() and _indent_fuzzy_replace() to edit_parser.py. Integrated as Tier 2.5 fallback in both validate_edits() and _apply_single_edit() — strips leading whitespace for matching, then re-applies the file's indentation pattern to the replacement. [2026-05-22]
-
+### 2. SEARCH Block Context Calculator {IMPLEMENTED}
+> Implemented: Added _calculate_context_hint() to edit_parser.py that finds minimum surrounding lines needed to disambiguate multi-match SEARCH blocks. Updated validate_edits() error message and _RETRY_TEMPLATE in agent.py. [2026-05-22]
 **Category:** edit-accuracy
-**Impact:** 4/5 — Edit parser logs show repeated Tier 2 failures where search text differs only in indentation; this is the most common edit failure mode for 8B models.
-**Effort:** S — ~40 lines modifying `_fuzzy_replace()` and `_normalize_whitespace()` in `edit_parser.py`.
+**Impact:** 4/5 — Multi-match SEARCH blocks are the most common Tier 1 failure; telling the model exactly how many context lines are needed dramatically improves retry success.
+**Effort:** S — ~40 lines, new function in edit_parser.py + update retry template in agent.py.
 **Priority Score:** 16
 
-**The Gap:** Cloud models produce edits with correct indentation because they can precisely track whitespace from file content in their large context windows. 8B models frequently get indentation wrong — off by one tab, mixing spaces and tabs, or using the wrong indent level after copy-pasting from context. The current fuzzy matcher only normalizes trailing whitespace, not leading whitespace.
+**The Gap:** Cloud models intuitively calibrate how much surrounding context to include in a search block. 8B models either include too little (matches multiple locations) or too much (doesn't exist verbatim). Current error message is generic: "must be unique. Add more context lines."
 
 **Proposed Approach:**
-- Add an indentation-normalizing comparison mode to `_fuzzy_replace()` in `edit_parser.py` that strips leading whitespace before matching, then re-applies the original file's indentation pattern to the replacement
-- Implement as a Tier 2.5 fallback: try exact match → try whitespace-normalized match → try indent-normalized match → Tier 3 whole-file
-- Detect the file's indentation style (tabs vs. spaces, indent width) from surrounding context
-- Preserve the replacement's relative indentation structure while adjusting the base indent level
+- Add `calculate_context_requirement(content, search_text, match_count)` to `edit_parser.py`
+- Scan backwards/forwards from each match to find minimum unique prefix/suffix
+- Return `(min_lines_needed, anchor_excerpt)` — e.g., "Add 5 lines above to disambiguate"
+- Update `_RETRY_TEMPLATE` in `agent.py` to include: "SEARCH matched N locations. Include N lines of surrounding code to make it unique."
+- Pass context requirement through `validate_edits()` error tuple
 
 **Files Affected:**
-- `probablyfine/edit_parser.py` — Enhance `_fuzzy_replace()` and add indent detection helper
+- `probablyfine/edit_parser.py` — add `calculate_context_requirement()`, enhance error detail in `validate_edits()`
+- `probablyfine/agent.py` — update `_RETRY_TEMPLATE` to include context guidance
 
 ---
 
-### 4. File-Aware Decomposition {IMPLEMENTED}
-> Implemented: Added _build_file_summary() that produces "path (N lines)" entries. Updated DECOMPOSE_PROMPT to require files arrays. Changed _decompose_and_parse() to inject file summary instead of bare path list. [2026-05-22]
-
-**Category:** task-decomposition
-**Impact:** 4/5 — Interpreter logs show most decomposed plans return empty `"files": []` arrays, forcing the agent to guess which files to edit; cloud models always know their targets.
-**Effort:** S — Modify `DECOMPOSE_PROMPT` in `interpreter.py`, inject file tree summary, ~30 lines.
+### 3. Fuzzy Anchor-Based Search {IMPLEMENTED}
+> Implemented: Added _fuzzy_anchor_replace() to edit_parser.py — extracts first/last non-blank non-comment lines as anchors, finds them in file content, replaces the region between. Inserted into _apply_single_edit() fallback chain between indent-fuzzy and failure. [2026-05-22]
+**Category:** edit-accuracy
+**Impact:** 4/5 — Catches the gap between indent-fuzzy matching (implemented) and whole-file fallback. Many failures involve correct core logic with drifted surrounding context.
+**Effort:** S — ~40 lines, new function in edit_parser.py inserted into existing fallback chain.
 **Priority Score:** 16
 
-**The Gap:** Cloud models with 128k+ context windows can see the entire project structure and produce plans that reference specific files. 8B models working from a generic prompt with `"(no files specified)"` as file context produce generic plans with empty file lists, making downstream execution imprecise.
+**The Gap:** Cloud models regenerate correct SEARCH blocks even when comments or blank lines shifted. 8B models generate SEARCH blocks where the core edited lines are correct but anchor lines (first/last non-blank lines) have drifted. Current fuzzy matching only handles whitespace differences.
 
 **Proposed Approach:**
-- In `_decompose_and_parse()`, build a compact file tree summary (path + line count) from `file_context` and inject it into `DECOMPOSE_PROMPT`
-- Format as `"Available files:\n  probablyfine/agent.py (850 lines)\n  probablyfine/checker.py (353 lines)\n..."`
-- Add an explicit instruction: "You MUST populate the files array for every edit/create/delete step using paths from the list above"
-- Cap the file tree to fit within token budget (~500 tokens)
+- Add `_fuzzy_anchor_replace(content, search, replace)` to `edit_parser.py`
+- Extract first and last non-blank, non-comment lines of SEARCH as anchors
+- Find those anchors in file content (allowing whitespace-fuzzy match)
+- Replace all content between found anchors with replacement text
+- Insert into `_apply_single_edit()` fallback chain between indent-fuzzy and failure
+- Log "Applied anchor-fuzzy match" when used
 
 **Files Affected:**
-- `probablyfine/interpreter.py` — Enhance `DECOMPOSE_PROMPT` template and `_decompose_and_parse()` to inject file metadata
+- `probablyfine/edit_parser.py` — add `_fuzzy_anchor_replace()`, insert into `_apply_single_edit()` fallback chain
 
 ---
 
-### 5. Cascading Failure Prevention {IMPLEMENTED}
-> Implemented: Added failed_step_ids tracking in execute_plan(). Steps with failed dependencies are skipped with status="skipped". Failed steps no longer break the loop — dependents are skipped and independent steps continue. [2026-05-22]
-
+### 4. Targeted Retry Context by Error Type {IMPLEMENTED}
+> Implemented: Added _classify_edit_error() to categorize failures as multi_match/not_found/generic. Enhanced _get_nearby_content() with error-type branching: multi_match shows all match locations, not_found uses difflib for closest match. Updated _RETRY_TEMPLATE with per-type guidance. [2026-05-22]
 **Category:** error-recovery
-**Impact:** 4/5 — Agent logs show steps executing after previous dependent steps failed (0/2 edit match rate followed by more edits on the same file), causing cascading corruption.
-**Effort:** S — Add failure gates in `agent.py` `execute_plan()`, ~30 lines.
+**Impact:** 4/5 — Generic retry prompts waste the model's second chance. Telling the model exactly what type of error it made enables targeted self-correction.
+**Effort:** S — ~50 lines in agent.py, modifying `_get_nearby_content()` and `_retry_with_error_context()`.
 **Priority Score:** 16
 
-**The Gap:** Cloud agents track step success/failure and skip dependent steps when a prerequisite fails, preserving a clean state. The current agent executes all steps sequentially regardless of previous failures, which means a failed edit in step 2 corrupts the context for steps 3-6.
+**The Gap:** Cloud models understand their own errors from context. 8B models given a retry prompt with just "error + nearby content" often repeat the same mistake. Categorized error context (multi-match → show all matches; hallucination → show file outline) enables targeted correction.
 
 **Proposed Approach:**
-- In `execute_plan()` in `agent.py`, track each step's `StepResult.status`
-- Before executing a step, check its `depends_on` list against completed step statuses
-- If any dependency failed, skip the step with `status="skipped"` and `error="dependency N failed"`
-- Report partial results (which steps succeeded, which were skipped) in the `AgentResult`
-- Log the skip chain for debugging
+- Modify `_get_nearby_content()` to accept `error_type` parameter
+- For "multi_match": show all match locations with line numbers
+- For "not_found" with close match: show closest match via difflib.get_close_matches
+- For "hallucination" (non-existent names): show file outline (function/class names via ast)
+- Update `_retry_with_error_context()` to pass error_type from validation
 
 **Files Affected:**
-- `probablyfine/agent.py` — Add dependency checking in `execute_plan()` loop
+- `probablyfine/agent.py` — modify `_get_nearby_content()` signature, add error-type branching, update `_retry_with_error_context()`
 
 ---
 
-### 6. Hallucination Validator Enhancement {IMPLEMENTED}
-> Implemented: Added fuzzy basename recovery and README.md filtering to _parse_file_list() in file_selector.py. Near-miss paths like "promotion.html" now resolve to "pages/promotion.html" when basename is unique. README.md dropped unless task mentions docs. [2026-05-22]
-
-**Category:** context-management
-**Impact:** 3/5 — File selector logs show ~30% of LLM selections include at least one hallucinated path, with multiple cases of all paths being hallucinated and falling through to keyword backup.
-**Effort:** XS — Add fuzzy basename matching to `_parse_file_list()` in `file_selector.py`, ~15 lines.
-**Priority Score:** 15
-
-**The Gap:** Cloud models with large context windows rarely hallucinate file paths because they can see the full file listing. 8B models frequently invent plausible-but-wrong paths (e.g., `promotion.html` when the tracked file is `pages/promotion.html`, or always including `README.md`). The current validator does strict equality matching and drops near-misses entirely.
-
-**Proposed Approach:**
-- In `_parse_file_list()` in `file_selector.py`, before dropping a path as hallucinated, try basename matching against the `git_files` set
-- If exactly one git file matches the hallucinated basename, substitute it
-- If multiple matches, log a warning and drop (ambiguous)
-- Add special handling for `README.md` — always drop it unless the task mentions documentation (it's hallucinated in 80% of selections)
-
-**Files Affected:**
-- `probablyfine/file_selector.py` — Enhance `_parse_file_list()` with fuzzy matching fallback
-
----
-
-### 7. Decomposition Timeout Resilience {IMPLEMENTED}
-> Implemented: Added streaming=True mode to _call_llm() that captures tokens as they arrive. On timeout, partial response is salvaged via _repair_truncated_json(). _decompose_task() now uses streaming mode. Non-decompose phases unchanged. [2026-05-22]
-
+### 5. Symbol Index for Decomposer {IMPLEMENTED}
+> Implemented: Added _build_codebase_summary() to interpreter.py — uses ast.parse to extract top-level function/class names per Python file, capped at 50 symbols. Appended to file_summary in _decompose_and_parse() so the decomposer sees real symbol names. [2026-05-22]
 **Category:** task-decomposition
-**Impact:** 3/5 — Interpreter logs show 5 decomposition timeouts producing single-step fallback plans; partial plans would be significantly better.
-**Effort:** XS — Add mid-timeout JSON salvage in `_decompose_and_parse()`, ~15 lines in `interpreter.py`.
-**Priority Score:** 15
+**Impact:** 4/5 — Decomposer currently gets file names + line counts but no code structure. Adding function/class names reduces hallucinated step targets from ~35% to <10%.
+**Effort:** S — ~50 lines, new function in interpreter.py using ast.walk.
+**Priority Score:** 16
 
-**The Gap:** Cloud models respond within seconds. 8B models on constrained hardware frequently exceed the 60s decomposition timeout, especially with thinking tokens enabled. The current fallback is a generic single-step plan that discards all the model's partial output. The `_repair_truncated_json()` infrastructure already exists but isn't applied to mid-timeout situations.
+**The Gap:** Cloud models analyze code structure during planning. The probablyfine decomposer gets file summaries with only names and line counts but no symbols. The model hallucinates function names or proposes edits to non-existent targets.
 
 **Proposed Approach:**
-- In `_call_llm()` in `interpreter.py`, when a timeout occurs during streaming, capture the partial response buffer instead of discarding it
-- Apply `_repair_truncated_json()` to the partial response to salvage any complete steps
-- If at least 1 valid step is recovered, use it as the plan instead of falling back to single-step
-- Log "Salvaged N steps from timed-out decomposition" for observability
+- Add `_build_codebase_summary(file_context, max_symbols=50)` to `interpreter.py`
+- Use `ast.parse` + `ast.walk` to extract function/class names per file
+- Append to decompose prompt: "Available symbols:\n  file.py: func1, func2, ClassName"
+- Cap at 50 symbols total to stay within token budget
+- Call in `_decompose_and_parse()` alongside existing `_build_file_summary()`
 
 **Files Affected:**
-- `probablyfine/interpreter.py` — Modify `_call_llm()` to capture partial streaming responses on timeout
+- `probablyfine/interpreter.py` — add `_build_codebase_summary()`, inject into `DECOMPOSE_PROMPT` formatting
 
 ---
 
-### 8. Negative Examples for Checker {IMPLEMENTED}
-> Implemented: Added 2 negative examples (style/docs) and 1 positive example (index bounds crash) to CHECKER_SYSTEM_PROMPT in checker.py. [2026-05-22]
-
+### 6. Classifier/Decomposer Few-Shot Examples {IMPLEMENTED}
+> Implemented: Added 2 few-shot examples to CLASSIFY_PROMPT (bug_fix complexity=1 + refactor complexity=3) and 1 few-shot example to DECOMPOSE_PROMPT (3-step feature edit). All inline in interpreter.py, compact to respect token budgets. [2026-05-22]
 **Category:** prompt-engineering
-**Impact:** 3/5 — Checker occasionally flags style issues despite explicit instructions not to; concrete negative examples would reinforce the boundary.
-**Effort:** XS — Add 1-2 negative examples to `CHECKER_SYSTEM_PROMPT` in `checker.py`, ~10 lines.
-**Priority Score:** 15
+**Impact:** 4/5 — Agent prompts already have few-shot examples, but classifier and decomposer have none. Adding 2-3 examples reduces classification errors and decomposition hallucinations.
+**Effort:** S — ~40 lines of prompt text additions across 2 files.
+**Priority Score:** 16
 
-**The Gap:** Cloud models reliably follow negative constraints ("do NOT flag style issues") from natural language instructions alone. 8B models benefit significantly from concrete negative examples — showing them "this is NOT an issue, do not flag it" alongside the real issues they should catch.
+**The Gap:** Cloud models use in-context learning naturally. The classifier and decomposer in interpreter.py have detailed instructions but zero examples. 8B models benefit disproportionately from few-shot examples compared to instruction-only prompts.
 
 **Proposed Approach:**
-- Add a "NOT an issue" section to `CHECKER_SYSTEM_PROMPT` in `checker.py` with 1-2 examples:
-  - Example: "Missing docstring on a function" → NOT an issue
-  - Example: "Variable named `x` instead of `descriptive_name`" → NOT an issue
-- Add a "IS an issue" example showing a real bug for contrast
-- Keep examples minimal to avoid consuming checker token budget
+- Add `_CLASSIFY_EXAMPLES` with 2 examples: simple task (bug_fix, complexity 1) and complex task (refactor, complexity 3)
+- Add `_DECOMPOSE_EXAMPLES` with 1 example: 3-step edit task showing correct JSON structure
+- Inject conditionally via `get_prompt_suffix()` in `ollama_utils.py`
+- Keep examples compact (< 200 tokens each) to respect 8B context limits
 
 **Files Affected:**
-- `probablyfine/checker.py` — Extend `CHECKER_SYSTEM_PROMPT` with negative examples
+- `probablyfine/interpreter.py` — add example constants, inject into prompts
+- `probablyfine/ollama_utils.py` — extend `get_prompt_suffix()` to handle examples phase
 
 ---
 
-### 9. Deletion-Ratio False Positive Guard {IMPLEMENTED}
-> Implemented: Added deletion-ratio check to should_reflect() in reflection.py. If deletions > 20 lines and exceed additions by 3:1, forces reflection regardless of mode. Placed before FAST mode skip so even fast mode gets safety coverage on large deletions. [2026-05-22]
-
+### 7. Pre-Checker Sanity Filter {IMPLEMENTED}
+> Implemented: Added quick_sanity_check() to checker.py — ast.parse on changed Python files to catch syntax errors in O(1). Called before LLM checker in _run_checker_loop() in reflection.py; returns immediate FAIL with structured issues. [2026-05-22]
 **Category:** review-quality
-**Impact:** 3/5 — No current mechanism detects when edits accidentally delete large amounts of code; cloud agents flag this automatically via their understanding of intent vs. diff.
-**Effort:** XS — Add line count heuristic in `reflection.py`, ~15 lines.
+**Impact:** 4/5 — Catches obvious bugs (syntax errors, undefined references) in O(1) before invoking the expensive checker LLM. Saves 30-60s per reflection iteration on trivially broken diffs.
+**Effort:** S — ~40 lines, new function called before `run_checker()`.
+**Priority Score:** 16
+
+**The Gap:** Cloud models pre-filter trivial issues internally. Currently every checker invocation is full-price even when the diff has obvious Python syntax errors. A quick `ast.parse` + reference check could catch 20-30% of failures instantly.
+
+**Proposed Approach:**
+- Add `_quick_sanity_check(diff, changed_files)` to `checker.py`
+- For Python files in diff: attempt `ast.parse` on the post-edit content — if SyntaxError, return immediate FAIL
+- Check for undefined name references: if diff adds a call to `foo()` but no `def foo` or `import foo` exists
+- Call before `run_checker()` in `_run_checker_loop()` — if sanity check fails, skip LLM and return structured CheckerResult
+- Log: "Pre-checker caught syntax error — skipping LLM review"
+
+**Files Affected:**
+- `probablyfine/checker.py` — add `_quick_sanity_check()` function
+- `probablyfine/reflection.py` — call before `run_checker()` in `_run_checker_loop()`
+
+---
+
+### 8. Intelligent File Content Sampling {EXISTING: next-improvements #17}
+**Category:** context-management
+**Impact:** 5/5 — Reduces context size 30-50% for large codebases by sending function signatures + docstrings instead of full bodies for non-targeted files.
+**Effort:** M — ~100 lines, new AST-based sampler + integration into `_format_file_contents()`.
 **Priority Score:** 15
 
-**The Gap:** Cloud models analyze the semantic relationship between a task and the resulting diff — they understand when "update the footer" shouldn't result in 200 lines deleted. 8B models sometimes produce edits that accidentally delete surrounding code (especially in whole-file fallback mode). The checker doesn't have a specific heuristic for disproportionate deletions.
+**The Gap:** Cloud models reason about code structure from summaries. probablyfine sends entire file contents via `_format_file_contents()`, consuming tokens on irrelevant function bodies. A 10KB file with 20 functions wastes tokens on 18 functions the model doesn't need.
 
 **Proposed Approach:**
-- In `should_reflect()` in `reflection.py`, add a deletion-ratio check: parse the diff to count `+` and `-` lines
-- If deletions exceed additions by more than 3:1 AND total deletions > 20 lines, force reflection regardless of mode
-- Log the deletion ratio for monitoring
-- Consider adding a pre-checker warning displayed to the user: "Warning: diff deletes N lines but only adds M"
+- Add `_sample_python_file(fpath, max_bytes=2000)` to `agent.py` using `ast.parse`
+- Extract: imports, class/function signatures + first-line docstrings, collapse bodies to `...`
+- For non-Python files: truncate to `max_bytes`
+- In `_format_file_contents()`, use sampling for "context" files (not the primary edit target)
+- Primary edit target files still get full content
+- Configurable via `AgentConfig.context_sampling` bool
 
 **Files Affected:**
-- `probablyfine/reflection.py` — Add deletion ratio heuristic to `should_reflect()`
+- `probablyfine/agent.py` — add `_sample_python_file()`, modify `_format_file_contents()`
+- `probablyfine/models.py` — add `context_sampling` to `AgentConfig`
 
 ---
 
-### 10. Line-Anchored Edit Format {IMPLEMENTED}
-> Implemented: Added `_LINE_ANCHORED_RE` regex and line-range replacement to edit_parser.py. FileEdit model extended with line_start/line_end fields. System prompt in agent.py updated with LINES format description. Supports `FILE: path LINES N-M` followed by `<<<<<<< REPLACE` / `>>>>>>> END` blocks. Graceful fallback on out-of-range lines. [2026-05-22]
-
-**Category:** edit-accuracy
-**Impact:** 4/5 — Eliminates the SEARCH block uniqueness requirement that causes many edit failures when 8B models can't produce sufficiently unique search text.
-**Effort:** M — New regex in `edit_parser.py`, system prompt update in `agent.py`, ~100 lines across 2 files.
-**Priority Score:** 12
-
-**The Gap:** Cloud models with massive context windows can always produce unique SEARCH blocks by including enough surrounding context. 8B models with limited context frequently produce non-unique search text (matching 2+ locations in a file). A line-anchored format like `LINES 42-50:` would bypass this fundamental limitation.
-
-**Proposed Approach:**
-- Add a new edit format to `edit_parser.py`: `FILE: path.py LINES 42-50` followed by replacement content
-- Add corresponding regex `_LINE_ANCHORED_RE` alongside existing `_SEARCH_REPLACE_RE`
-- In `agent.py` system prompt, present line-anchored format as an alternative when the model knows line numbers
-- In `_apply_single_edit()`, implement line-range replacement using line numbers from the edit
-- Fall back gracefully if line numbers are out of range (file modified since model saw it)
-
-**Files Affected:**
-- `probablyfine/edit_parser.py` — Add `_LINE_ANCHORED_RE` regex and line-based apply logic
-- `probablyfine/agent.py` — Update system prompt to describe the line-anchored format option
-
----
-
-### 11. File Size Awareness in Context Budget {IMPLEMENTED}
-> Implemented: Added `max_context_bytes` config option (default 48000, ~12k tokens) to config.py. Added `_filter_by_budget()` to file_selector.py that skips files exceeding remaining byte budget with logging. Wired into cli.py callsite via `get_max_context_bytes()`. [2026-05-22]
-
+### 9. Stale Context Detection {IMPLEMENTED}
+> Implemented: Added _mtimes dict, update_mtime(), needs_refresh(), stale_files() to FileContext in context.py. Added module-level _file_mtimes cache in agent.py _format_file_contents() — detects and logs when files have been modified between steps. [2026-05-22]
 **Category:** context-management
-**Impact:** 3/5 — Large files silently consume the context window, leaving insufficient room for model reasoning; cloud models handle this with 128k+ windows.
-**Effort:** S — Add size tracking to `file_selector.py` and `context.py`, ~40 lines across 2 files.
-**Priority Score:** 12
+**Impact:** 3/5 — Catches subtle bugs when step N edits a file that step N+1's context was built from. Important for multi-step plans.
+**Effort:** XS — ~20 lines, mtime tracking in FileContext + check in `_format_file_contents()`.
+**Priority Score:** 15
 
-**The Gap:** Cloud models have 128k-200k token context windows where file size rarely matters. With 8B models limited to 16k tokens, a single large file can consume the entire context budget, leaving no room for the system prompt, task description, or model reasoning. Neither `file_selector.py` nor `context.py` track or limit by file size.
+**The Gap:** Cloud models re-read files naturally between steps. probablyfine reads files once at step start and only refreshes when explicitly triggered. If step 2 edits `auth.py` and step 3 reads stale `auth.py` content, step 3 may generate incorrect edits.
 
 **Proposed Approach:**
-- Add a `size_bytes` property to tracked files in `FileContext` in `context.py`
-- In `select_files()` in `file_selector.py`, estimate token count (bytes / 4) and skip files that would exceed remaining context budget
-- Add a configurable `max_context_bytes` to `config.py` (default: 48000 = ~12k tokens, leaving 4k for prompt + reasoning)
-- Log when files are excluded due to size budget: "Excluding large_file.py (15k tokens) — exceeds remaining budget"
+- Add `_mtimes: dict[str, float]` to `FileContext` class in `context.py`
+- Add `needs_refresh(fpath)` method: compare current mtime to stored mtime
+- Add `update_mtime(fpath)` method: record after reading
+- In `_format_file_contents()`, log warning if any file needs refresh
+- In `execute_plan()`, automatically re-read stale files before each step
 
 **Files Affected:**
-- `probablyfine/context.py` — Add size tracking to `FileContext`
-- `probablyfine/file_selector.py` — Add budget-aware file filtering
-- `probablyfine/config.py` — Add `max_context_bytes` config option
+- `probablyfine/context.py` — add mtime tracking to `FileContext`
+- `probablyfine/agent.py` — check staleness in `_format_file_contents()`
 
 ---
 
-### 12. Model-Specific Prompt Variants {IMPLEMENTED}
-> Implemented: Added centralized `_MODEL_PROMPT_SUFFIXES` registry and `get_prompt_suffix()` in ollama_utils.py. Deepseek-coder gets JSON schema reinforcement suffixes for checker, classify, decompose, and file_selector phases. Wired into checker.py (system prompt), interpreter.py (classify + decompose prompts), and file_selector.py (selection prompt). [2026-05-22]
-
-**Category:** prompt-engineering
-**Impact:** 4/5 — Checker logs show deepseek-coder:6.7b returning completely non-conforming JSON schemas (`{"status": "success", "data": ...}` instead of `{"verdict": ...}`), proving the same prompt doesn't work across models.
-**Effort:** M — Prompt variants for each module that calls LLM, ~100 lines across 3-4 files.
-**Priority Score:** 12
-
-**The Gap:** Cloud APIs have consistent instruction-following behavior. Different local models respond very differently to the same prompt — qwen3:8b mostly follows JSON format instructions while deepseek-coder:6.7b frequently invents its own response schema. Using identical prompts for both models wastes the checker entirely when deepseek is active.
-
-**Proposed Approach:**
-- Create a prompt registry dict in `ollama_utils.py` or a new `prompts.py`: `{model_name: {phase: prompt_template}}`
-- For deepseek-coder, add stronger JSON schema reinforcement — repeat the exact expected keys at the end of the prompt
-- For qwen3:8b, continue using `/no_think` suffix where appropriate
-- In `checker.py`, `interpreter.py`, and `file_selector.py`, look up model-specific prompt before falling back to default
-- Start with checker prompts (highest impact) then expand to others
-
-**Files Affected:**
-- `probablyfine/checker.py` — Add model-specific prompt selection
-- `probablyfine/interpreter.py` — Add model-specific prompt selection
-- `probablyfine/file_selector.py` — Add model-specific prompt selection
-- `probablyfine/ollama_utils.py` — Optional: add prompt registry
-
----
-
-### 13. Replan-on-Failure with Context Update {IMPLEMENTED}
-> Implemented: Added `_build_replan_prompt()` and `_MAX_REPLANS=1` to agent.py. After the main execution loop, if steps were skipped due to dependency failures, invokes `interpret_task()` with a summary of what succeeded/failed, then executes the new plan via recursive `execute_plan()` with depth cap. [2026-05-22]
-
-**Category:** multi-file-reasoning
-**Impact:** 4/5 — When mid-plan steps fail, the agent cannot adapt; cloud models re-evaluate and adjust their approach based on what they've learned so far.
-**Effort:** M — Modify `execute_plan()` to re-invoke interpreter on step failure, ~100 lines in `agent.py`.
-**Priority Score:** 12
-
-**The Gap:** Cloud agents dynamically adjust their plans when a step fails — they understand what went wrong, update their mental model, and try a different approach. The current agent either continues blindly (cascading failure) or falls back to whole-file replacement. There is no mechanism to "replan" with updated context after partial execution.
-
-**Proposed Approach:**
-- In `execute_plan()` in `agent.py`, when a step fails and has unexecuted dependents, trigger a replan
-- Build a "replan prompt" that includes: original task, what succeeded, what failed and why, current file state
-- Call `interpret_task()` from `interpreter.py` with the replan prompt and updated file context
-- Execute the new plan's remaining steps
-- Cap replanning to 1 attempt per execution to avoid infinite loops
-- Log replan events with before/after step comparison
-
-**Files Affected:**
-- `probablyfine/agent.py` — Add replan trigger and re-invoke logic in `execute_plan()`
-- `probablyfine/interpreter.py` — May need a lightweight `replan_task()` variant
-
----
-
-### 14. Dynamic num_predict by Step Type {IMPLEMENTED}
-> Implemented: Added `_STEP_NUM_PREDICT` lookup dict and `_get_step_budget()` helper in agent.py. Edit=4096, create=6144, explain=4096, read=512, verify=512, delete=256. Applied to both `_execute_edit` and `_execute_explain` streaming calls. [2026-05-22]
-
-**Category:** token-efficiency
-**Impact:** 2/5 — Saves tokens and reduces generation time for lightweight steps, but doesn't directly improve output quality.
-**Effort:** XS — Lookup table in `agent.py`, ~10 lines.
-**Priority Score:** 10
-
-**The Gap:** Cloud APIs charge per-token but have effectively unlimited generation budgets. With 8B models, oversized `num_predict` on simple steps (explain, verify) wastes time and VRAM, while undersized budgets on complex steps (create) cause truncation. Fixed `num_predict=4096` is a compromise that's wrong for most steps.
-
-**Proposed Approach:**
-- Add a step-type → num_predict mapping in `agent.py`: `{"explain": 4096, "edit": 2048, "create": 6144, "read": 512, "verify": 512, "delete": 256}`
-- In `execute_step()`, look up the step's action to set `num_predict` dynamically
-- Make the mapping configurable via `config.py` under `[agent]` section
-- Log the per-step budget for monitoring
-
-**Files Affected:**
-- `probablyfine/agent.py` — Add step-type budget lookup in step execution
-- `probablyfine/config.py` — Optional: add configurable budget overrides
-
----
-
-### 15. Context Utilization Tracking {IMPLEMENTED}
-> Implemented: Added `log_token_usage()` helper in ollama_utils.py that extracts prompt_eval_count/eval_count from Ollama responses and logs utilization percentage to tokens.log. Wired into interpreter.py (non-streaming classify/validate calls) and file_selector.py. [2026-05-22]
-
-**Category:** token-efficiency
-**Impact:** 2/5 — Pure observability improvement; enables data-driven optimization of context budgets but has no direct quality impact.
-**Effort:** XS — Add logging after each LLM call in `ollama_utils.py`, ~15 lines.
-**Priority Score:** 10
-
-**The Gap:** Cloud providers offer token usage metrics in every API response. Ollama provides `eval_count` and `prompt_eval_count` in responses but probablyfine doesn't track or log them. Without this data, context budget tuning is guesswork.
-
-**Proposed Approach:**
-- In `extract_content()` in `ollama_utils.py`, also extract `eval_count` and `prompt_eval_count` from the response
-- Add a `log_token_usage(phase, model, prompt_tokens, completion_tokens, num_ctx)` helper
-- Call it after every non-streaming LLM call in `interpreter.py`, `file_selector.py`, and `checker.py`
-- Log format: `[tokens] phase=classify model=qwen3:8b prompt=1234/16384 (7.5%) completion=456/800`
-
-**Files Affected:**
-- `probablyfine/ollama_utils.py` — Add token extraction and logging helper
-
----
-
-### 16. Edit Count Capping with Multi-Turn Continuation {IMPLEMENTED}
-> Implemented: Added `MAX_EDITS_PER_RESPONSE=10` constant in edit_parser.py. In agent.py, `_execute_edit()` caps parsed edits to 10, applies them, then re-invokes the model with a continuation prompt for remaining edits (up to 3 rounds). Added `_CONTINUATION_TEMPLATE` and `_MAX_CONTINUATION_ROUNDS=3`. [2026-05-22]
-
-**Category:** edit-accuracy
-**Impact:** 3/5 — Prevents the worst-case edit storms (74 edits in one response) but these are infrequent; capping improves reliability of each individual edit.
-**Effort:** M — Changes in `agent.py` (prompt + continuation logic) and `edit_parser.py` (cap), ~100 lines.
-**Priority Score:** 9
-
-**The Gap:** Cloud models can reliably produce dozens of coherent edits in a single response because they maintain precise state across their large context windows. 8B models producing 74 SEARCH/REPLACE blocks in one response (as seen in edit_parser.log) inevitably degrade in quality — later edits reference stale state and produce mismatches.
-
-**Proposed Approach:**
-- Add `MAX_EDITS_PER_RESPONSE = 10` constant in `edit_parser.py`
-- In `parse_edits()`, if more than `MAX_EDITS_PER_RESPONSE` blocks are found, only return the first N
-- In `agent.py`, after applying capped edits, if more were parsed, re-invoke the model with "Continue editing — the following edits remain:" prompt
-- Add iteration cap (max 3 continuation rounds) to prevent infinite loops
-- Log cap events: "Capped 74 edits to 10, triggering continuation"
-
-**Files Affected:**
-- `probablyfine/edit_parser.py` — Add `MAX_EDITS_PER_RESPONSE` cap
-- `probablyfine/agent.py` — Add multi-turn continuation logic when edits are capped
-
----
-
-### 17. Cross-File Consistency Check {IMPLEMENTED}
-> Implemented: Added `_verify_cross_file_consistency()` in agent.py — uses ast.parse to extract definitions and imports from changed Python files, checks that imported names still exist in their source files. Runs after all steps complete in execute_plan(), reports warnings non-blockingly. [2026-05-22]
-
-**Category:** multi-file-reasoning
-**Impact:** 3/5 — Catches cross-file reference breaks (renamed function not updated in importers), a common 8B model error on multi-file tasks.
-**Effort:** M — New function in `agent.py` or new module, AST-based import scanning, ~120 lines.
-**Priority Score:** 9
-
-**The Gap:** Cloud models can mentally track all cross-file references and ensure consistency across a multi-file edit. 8B models frequently rename a function in one file but forget to update callers in other files, or add an import that references a non-existent module. No post-edit verification currently exists.
-
-**Proposed Approach:**
-- Add a `verify_cross_file_consistency(changed_files)` function in `agent.py`
-- For Python files: use `ast.parse()` to extract imports and function/class definitions from each changed file
-- Check that all imports resolve to existing modules/functions in the project
-- Check that renamed identifiers are updated in all files that reference them
-- Run after `apply_edits_atomic()` completes successfully
-- Report inconsistencies as warnings (don't block, but log for checker to review)
-
-**Files Affected:**
-- `probablyfine/agent.py` — Add post-edit consistency verification function
-
----
-
-### 18. Step Dependency Validation (Rule-Based) {IMPLEMENTED}
-> Implemented: Replaced LLM-based `_validate_plan()` with pure-Python topological sort (Kahn's algorithm). Rules: read before edit on same file, create before edit, verify always last. Removed `VALIDATE_TIMEOUT`, `VALIDATE_NUM_PREDICT` constants and `VALIDATE_PROMPT` template. [2026-05-22]
-
+### 10. Dynamic Step Cap by Complexity {IMPLEMENTED}
+> Implemented: Added _get_step_budget(complexity, task_len) — complexity 1→3 steps, 2→6, 3→10, plus bonus for long task descriptions. Updated DECOMPOSE_PROMPT with {max_steps} placeholder, threaded complexity through _decompose_and_parse() and _decompose_task(). [2026-05-22]
 **Category:** task-decomposition
-**Impact:** 2/5 — The LLM validator mostly returns "unchanged" and times out 6/8 times; replacing it saves time but doesn't change output quality much.
-**Effort:** S — Replace `_validate_plan()` LLM call with topological sort in `interpreter.py`, ~40 lines.
-**Priority Score:** 8
+**Impact:** 3/5 — Complex tasks (complexity=3) get truncated at 6 steps. Allowing 8-10 steps for detailed tasks improves plan quality.
+**Effort:** XS — ~15 lines, new function + update to cap logic in interpreter.py.
+**Priority Score:** 15
 
-**The Gap:** Cloud models can validate plan ordering as part of their reasoning process. The current approach uses a separate LLM call to validate step ordering, which times out 75% of the time (6/8 attempts in logs). A rule-based topological sort would be instant and deterministic.
+**The Gap:** Cloud models generate plans of appropriate length. probablyfine caps at `MAX_DECOMPOSITION_STEPS = 6` regardless of task complexity. Simple tasks need 1-2 steps; complex refactors need 8-10.
 
 **Proposed Approach:**
-- Replace `_validate_plan()` in `interpreter.py` with a pure-Python topological sort
-- Rules: "read" before "edit" for the same file; "create" before "edit" for new files; "verify" always last
-- Detect and break circular dependencies by removing the weakest edge
-- Remove the `VALIDATE_TIMEOUT` and `VALIDATE_NUM_PREDICT` constants (no longer needed)
-- Keep the function signature for backward compatibility
+- Add `_get_step_budget(complexity, task_len)` to `interpreter.py`
+- Complexity 1 → max 3 steps, complexity 2 → max 6, complexity 3 → max 10
+- Bonus: +1 step per 100 chars of task description, capped at 10
+- Update `DECOMPOSE_PROMPT` to include dynamic `{max_steps}` placeholder
+- Update `_decompose_and_parse()` to use dynamic cap instead of constant
 
 **Files Affected:**
-- `probablyfine/interpreter.py` — Replace `_validate_plan()` with rule-based validation
+- `probablyfine/interpreter.py` — add `_get_step_budget()`, update prompt and cap logic
+
+---
+
+### 11. Edit Block Ordering (Bottom-Up Apply) {IMPLEMENTED}
+> Implemented: Added _sort_edits_bottom_up() to edit_parser.py — groups edits by file, sorts each group by estimated line position descending (line-anchored or SEARCH text position). Called at start of apply_edits_atomic(). [2026-05-22]
+**Category:** edit-accuracy
+**Impact:** 3/5 — Applying multiple edits to the same file top-down shifts line numbers. Bottom-up apply eliminates this class of failures.
+**Effort:** S — ~30 lines, new sort function in edit_parser.py.
+**Priority Score:** 12
+
+**The Gap:** Cloud models generate edits in safe order. 8B models list edits in narrative order (top-to-bottom), but applying top-to-bottom shifts line numbers for later edits.
+
+**Proposed Approach:**
+- Add `_sort_edits_bottom_up(edits)` to `edit_parser.py`
+- For line-anchored edits: sort by `line_end` descending within each file
+- For SEARCH/REPLACE: estimate position by finding search text in file, sort descending
+- Call at the start of `apply_edits_atomic()` before the apply loop
+
+**Files Affected:**
+- `probablyfine/edit_parser.py` — add `_sort_edits_bottom_up()`, call in `apply_edits_atomic()`
+
+---
+
+### 12. Structured Edit Error Classification {IMPLEMENTED}
+> Implemented: Added EDIT_ERR_* constants to models.py. Updated validate_edits() in edit_parser.py to return 3-tuples (edit, msg, error_type). Updated agent.py to unpack error_type and pass directly to _retry_with_error_context(), removing the string-based _classify_edit_error(). [2026-05-22]
+**Category:** edit-accuracy
+**Impact:** 4/5 — Classifying errors as hallucination/multi-match/indent-mismatch enables targeted recovery strategies instead of generic retries.
+**Effort:** M — ~100 lines across 3 files (new dataclass, classification logic, retry integration).
+**Priority Score:** 12
+
+**The Gap:** Cloud models understand error types from context. probablyfine treats all SEARCH validation failures identically. Knowing the error TYPE enables the retry prompt to give targeted guidance.
+
+**Proposed Approach:**
+- Add `EditErrorType` enum to `models.py`: `NOT_FOUND`, `MULTI_MATCH`, `INDENT_MISMATCH`, `HALLUCINATION`
+- Add `EditValidationError` dataclass with error_type, match_count, closest_match, suggestion
+- In `validate_edits()`, classify each error using difflib and ast
+- Return structured errors instead of `(edit, error_string)` tuples
+
+**Files Affected:**
+- `probablyfine/models.py` — add `EditErrorType` enum, `EditValidationError` dataclass
+- `probablyfine/edit_parser.py` — refactor `validate_edits()` return type
+- `probablyfine/agent.py` — consume structured errors in `_execute_edit()`
+
+---
+
+### 13. Checker Failure Mode Categorization {IMPLEMENTED}
+> Implemented: Added CHECKER_* failure mode constants and failure_mode field to CheckerResult in models.py. Tagged all failure paths in checker.py (hang, OOM, timeout, empty, parse_fail). Added failure_mode reaction in reflection.py _run_checker_loop() — hang/OOM skips remaining iterations. [2026-05-22]
+**Category:** error-recovery
+**Impact:** 3/5 — Different checker failures (hang, OOM, timeout) should trigger different recovery strategies instead of uniform "PASS with 0 confidence."
+**Effort:** S — ~50 lines across 3 files.
+**Priority Score:** 12
+
+**The Gap:** When probablyfine's checker hangs, OOMs, or times out, it uniformly returns a lenient PASS. But hang → skip remaining iterations; OOM → reduce diff size; timeout → model is slow, not wrong.
+
+**Proposed Approach:**
+- Add `CheckerFailureMode` enum to `models.py`: `HANG`, `OOM`, `TIMEOUT`, `INVALID_JSON`
+- Add `failure_mode` field to `CheckerResult`
+- In `run_checker()`, categorize exceptions
+- In `_run_checker_loop()`, react to failure_mode appropriately
+
+**Files Affected:**
+- `probablyfine/models.py` — add enum, update `CheckerResult`
+- `probablyfine/checker.py` — categorize failures
+- `probablyfine/reflection.py` — react to failure_mode
+
+---
+
+### 14. Import Chain Following for Auto-Selection {IMPLEMENTED}
+> Implemented: Added _extract_imports() (ast-based) and _follow_import_chain() (BFS depth=1, cap=20 files) to file_selector.py. Builds module-to-file mapping from git files, follows imports from seed files. Integrated into select_files() after keyword+LLM merge. [2026-05-22]
+**Category:** context-management
+**Impact:** 4/5 — File selector misses imported files. Following import chains improves recall from ~65% to 85%+.
+**Effort:** M — ~80 lines, ast-based import extraction + BFS traversal.
+**Priority Score:** 12
+
+**The Gap:** Cloud models reason about module dependencies. probablyfine's file selector uses keyword matching + LLM guess but never follows import chains.
+
+**Proposed Approach:**
+- Add `_follow_import_chain(git_files, seed_files, max_depth=1)` to `file_selector.py`
+- Use `ast.parse` + `ast.walk` to find ImportFrom and Import nodes
+- Map module paths back to repo files via substring matching
+- BFS to depth 1, cap at 20 files total
+
+**Files Affected:**
+- `probablyfine/file_selector.py` — add `_follow_import_chain()`, integrate into `select_files()`
+
+---
+
+### 15. Complexity-Aware /no_think Scheduling {IMPLEMENTED}
+> Implemented: DECOMPOSE_PROMPT uses {thinking_suffix} placeholder; _decompose_task() conditionally omits /no_think and increases num_predict to 3000 when complexity >= 3. [2026-05-22]
+**Category:** prompt-engineering
+**Impact:** 3/5 — Allowing thinking tokens for complexity=3 tasks improves decomposition quality at the cost of some tokens.
+**Effort:** S — ~30 lines, conditional suffix logic in interpreter.py.
+**Priority Score:** 12
+
+**The Gap:** qwen3:8b's thinking mode is disabled via `/no_think` for all structured output. But complex tasks benefit from thinking tokens.
+
+**Proposed Approach:**
+- Keep `/no_think` for classification (always structured)
+- Conditionally omit `/no_think` for decompose when complexity=3
+- Increase `DECOMPOSE_NUM_PREDICT` from 2000 to 3000 when thinking is allowed
+- Strip thinking tags via `strip_think_tags()` before JSON parsing
+
+**Files Affected:**
+- `probablyfine/interpreter.py` — conditional `/no_think` in `_decompose_task()`, dynamic num_predict
+
+---
+
+### 16. Import Graph for Pre-Execution Planning {IMPLEMENTED}
+> Implemented: Added _build_import_graph() using ast-based import analysis. Integrated into execute_plan() — graph built before step execution, used by _should_replan() (triggers replan when file has >2 dependents) and _refresh_step_files() (adds dependent files to context). [2026-05-22]
+**Category:** multi-file-reasoning
+**Impact:** 4/5 — Cross-file consistency check is post-hoc only. Pre-execution import graph enables proactive dependency-aware step context.
+**Effort:** M — ~80 lines, graph builder + integration into execute_plan().
+**Priority Score:** 12
+
+**The Gap:** `_verify_cross_file_consistency()` only runs AFTER all edits. If step 2 renames a function in module A, step 3 should already know about modules B and C that import from A.
+
+**Proposed Approach:**
+- Add `_build_import_graph(files)` to `agent.py` — returns file→imports mapping
+- Call at start of `execute_plan()` before executing steps
+- When step targets file A, check graph for dependents, add to step context
+- Inform `_should_replan()`: replan if edited file has >2 dependents
+
+**Files Affected:**
+- `probablyfine/agent.py` — add `_build_import_graph()`, integrate into `execute_plan()` and `_should_replan()`
+
+---
+
+### 17. Dynamic Token Budget by Context Size {IMPLEMENTED}
+> Implemented: Added _measure_context() and scaled _get_step_budget() by context_bytes and file_count (0.5x–2.0x). Updated all 3 call sites in _execute_edit and _execute_explain. [2026-05-22]
+**Category:** token-efficiency
+**Impact:** 3/5 — Static num_predict values don't account for context size. Scaling by context prevents both waste and truncation.
+**Effort:** S — ~30 lines, modify `_get_step_budget()` to accept context parameters.
+**Priority Score:** 12
+
+**The Gap:** Cloud models adjust output length based on input complexity. probablyfine assigns fixed token budgets per action type regardless of context size or file count.
+
+**Proposed Approach:**
+- Modify `_get_step_budget(action, context_size=0, file_count=1)` in `agent.py`
+- Scale: `1.0 + (context_size / 48000) * 0.5 + (min(file_count, 5) / 5) * 0.3`, clamped 0.5x–2.0x
+- Pass context size from `_execute_edit()` and `_execute_explain()`
+- Log adjusted budget
+
+**Files Affected:**
+- `probablyfine/agent.py` — modify `_get_step_budget()` signature and callers
+
+---
+
+### 18. Misbehavior Observer: Oscillation Detection {EXISTING: next-improvements #4}
+**Category:** error-recovery
+**Impact:** 3/5 — Current observer only detects exact reasoning loops. Oscillation detection catches fail→ok→fail→ok patterns.
+**Effort:** S — ~40 lines, extend `_MisbehaviorObserver` class.
+**Priority Score:** 12
+
+**The Gap:** The current observer (agent.py) only catches exact repetitions. It misses alternating patterns where the model flip-flops between approaches.
+
+**Proposed Approach:**
+- Add `check_oscillation()` — track success/failure in 6-item window, detect alternating pattern
+- Add `check_escalation()` — flag if each retry error is longer than previous
+- Call both in `execute_plan()` step loop
+- On oscillation: break plan; on escalation: log warning
+
+**Files Affected:**
+- `probablyfine/agent.py` — extend `_MisbehaviorObserver` class, add calls in `execute_plan()`
+
+---
+
+### 19. Unified Diff Format Support {IMPLEMENTED}
+> Implemented: Added _UNIFIED_DIFF_RE, _HUNK_HEADER_RE regexes and _parse_unified_diff() to edit_parser.py. Integrated as fourth format in parse_edits(). Added unified diff documentation to AGENT_SYSTEM_PROMPT. [2026-05-22]
+**Category:** edit-accuracy
+**Impact:** 3/5 — Alternative edit format for cases where SEARCH/REPLACE fails. Some 8B models generate unified diffs more reliably.
+**Effort:** M — ~120 lines, new regex + parser + prompt update.
+**Priority Score:** 9
+
+**The Gap:** probablyfine only supports SEARCH/REPLACE, CONTENT/END, and line-anchored formats. Some 8B models produce correct unified diffs more reliably because they're trained on git diff output.
+
+**Proposed Approach:**
+- Add `_UNIFIED_DIFF_RE` regex for `@@` hunk headers to `edit_parser.py`
+- Add `_parse_unified_diff(match)` — convert hunk to FileEdit with line_start/line_end
+- Insert into `parse_edits()` as fourth format check
+- Update `AGENT_SYSTEM_PROMPT` to document format as optional
+
+**Files Affected:**
+- `probablyfine/edit_parser.py` — add regex, parser, integrate into `parse_edits()`
+- `probablyfine/agent.py` — update system prompt
+
+---
+
+### 20. Reusable Plan Templates {IMPLEMENTED}
+> Implemented: Added _PLAN_TEMPLATES list with 6 patterns (add_import, rename_symbol, add_config, simple_bugfix, add_function, add_constant) and _match_template() keyword matcher. Integrated as Phase 3b in interpret_task(), before LLM decompose. [2026-05-22]
+**Category:** task-decomposition
+**Impact:** 3/5 — Common patterns (30-50% of tasks) could skip the 60s LLM decompose call by using keyword-matched templates.
+**Effort:** M — ~100 lines, template dict + keyword matching.
+**Priority Score:** 9
+
+**The Gap:** Cloud models decompose instantly. probablyfine's decompose phase takes 30-60s per task via LLM. Common patterns could use pre-built templates.
+
+**Proposed Approach:**
+- Add `_PLAN_TEMPLATES` dict to `interpreter.py` with 5-6 patterns: add_endpoint, fix_import, rename_symbol, add_config, simple_bugfix
+- Add `_match_template(task, intent)` — keyword heuristic
+- In `interpret_task()`, check templates before LLM decompose
+- Templates use placeholder files; file selector fills them in
+- Fallback to LLM if no match or template errors
+
+**Files Affected:**
+- `probablyfine/interpreter.py` — add templates dict, matching function, integrate into `interpret_task()`
 
 ---
 
 ## Existing Items Referenced
 | Source File | Item # | Title | Status |
 |---|---|---|---|
-| next-improvements.md | 18 | Cross-File Import Chain Analysis | OPEN |
-| next-improvements.md | 11 | Diff-Aware Retry Prompts | OPEN |
-| next-improvements.md | 14 | Pre-Edit Syntax Validation | OPEN |
-| next-improvements.md | 9 | Schema Validation for LLM Responses | OPEN |
+| next-improvements.md | 17 | Incremental Context Compression | OPEN |
+| next-improvements.md | 4 | Misbehavior Observer | OPEN |
+| next-improvements.md | 2 | Destructive Edit Protection | OPEN |
 
 ## Priority Matrix
 | Score | Feature | Impact | Effort | Category |
 |-------|---------|--------|--------|----------|
-| 25 | Few-Shot Edit Examples in System Prompt | 5 | XS | prompt-engineering |
-| 20 | Zero-Token Detection and Auto-Retry | 5 | S | error-recovery |
-| 16 | Indentation-Aware Fuzzy Matching | 4 | S | edit-accuracy |
-| 16 | File-Aware Decomposition | 4 | S | task-decomposition |
-| 16 | Cascading Failure Prevention | 4 | S | error-recovery |
-| 15 | Hallucination Validator Enhancement | 3 | XS | context-management |
-| 15 | Decomposition Timeout Resilience | 3 | XS | task-decomposition |
-| 15 | Negative Examples for Checker | 3 | XS | prompt-engineering |
-| 15 | Deletion-Ratio False Positive Guard | 3 | XS | review-quality |
-| 12 | Line-Anchored Edit Format | 4 | M | edit-accuracy |
-| 12 | File Size Awareness in Context Budget | 3 | S | context-management |
-| 12 | Model-Specific Prompt Variants | 4 | M | prompt-engineering |
-| 12 | Replan-on-Failure with Context Update | 4 | M | multi-file-reasoning |
-| 10 | Dynamic num_predict by Step Type | 2 | XS | token-efficiency |
-| 10 | Context Utilization Tracking | 2 | XS | token-efficiency |
-| 9 | Edit Count Capping with Multi-Turn Continuation | 3 | M | edit-accuracy |
-| 9 | Cross-File Consistency Check | 3 | M | multi-file-reasoning |
-| 8 | Step Dependency Validation (Rule-Based) | 2 | S | task-decomposition |
-
-## Empirical Data
-| Log File | Entries Analyzed | Key Metrics |
-|---|---|---|
-| agent.log | 100 lines, ~15 sessions | Tier 2 retries: 5 (mixed success), Tier 3 fallbacks: 1, zero-token stalls: 1 (171s wasted), edit match rate warnings: 3 (0/2, 0/2, 2/3) |
-| checker.log | 307 lines, 22 sessions | PASS: 14 (64%), FAIL: 3 (14%), zero-token timeout: 5 (23%), wrong JSON schema: 3, avg time: 50-100s per check |
-| edit_parser.log | 50 lines | Max edits/response: 74, SEARCH not found: 4, fuzzy match success: 1, atomic rollback: 1, new file creates: 3 |
-| file_selector.log | 183 lines, ~25 selections | Hallucinated paths: ~30% of selections, README.md hallucinated in 80% of cases, all-paths-hallucinated: 3 events, Ollama connection error: 1 |
-| interpreter.log | 708 lines, ~30 sessions | Classification empty: 5, decomposition timeout: 5 (60s), validation timeout: 6 (25s), fallback plans: 8, truncated JSON repairs: 8, clarity < threshold: 6 |
+| 20 | Whole-File Fallback Size Guard | 4 | XS | error-recovery |
+| 16 | SEARCH Block Context Calculator | 4 | S | edit-accuracy |
+| 16 | Fuzzy Anchor-Based Search | 4 | S | edit-accuracy |
+| 16 | Targeted Retry Context by Error Type | 4 | S | error-recovery |
+| 16 | Symbol Index for Decomposer | 4 | S | task-decomposition |
+| 16 | Classifier/Decomposer Few-Shot Examples | 4 | S | prompt-engineering |
+| 16 | Pre-Checker Sanity Filter | 4 | S | review-quality |
+| 15 | Intelligent File Content Sampling | 5 | M | context-management |
+| 15 | Stale Context Detection | 3 | XS | context-management |
+| 15 | Dynamic Step Cap by Complexity | 3 | XS | task-decomposition |
+| 12 | Edit Block Ordering (Bottom-Up) | 3 | S | edit-accuracy |
+| 12 | Structured Edit Error Classification | 4 | M | edit-accuracy |
+| 12 | Checker Failure Mode Categorization | 3 | S | error-recovery |
+| 12 | Import Chain Following | 4 | M | context-management |
+| 12 | Complexity-Aware /no_think Scheduling | 3 | S | prompt-engineering |
+| 12 | Import Graph for Pre-Execution Planning | 4 | M | multi-file-reasoning |
+| 12 | Dynamic Token Budget by Context Size | 3 | S | token-efficiency |
+| 12 | Misbehavior Observer: Oscillation | 3 | S | error-recovery |
+| 9 | Unified Diff Format Support | 3 | M | edit-accuracy |
+| 9 | Reusable Plan Templates | 3 | M | task-decomposition |

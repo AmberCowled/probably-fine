@@ -7,6 +7,7 @@ class FileContext:
 
     def __init__(self):
         self._files: list[Path] = []
+        self._mtimes: dict[str, float] = {}  # path -> mtime when last read
 
     @property
     def files(self) -> list[str]:
@@ -57,6 +58,26 @@ class FileContext:
         count = len(self._files)
         self._files.clear()
         return count
+
+    def update_mtime(self, fpath: str) -> None:
+        """Record the current mtime for a file (call after reading)."""
+        try:
+            self._mtimes[fpath] = Path(fpath).stat().st_mtime
+        except OSError:
+            pass
+
+    def needs_refresh(self, fpath: str) -> bool:
+        """Check if a file has been modified since we last recorded its mtime."""
+        if fpath not in self._mtimes:
+            return False
+        try:
+            return Path(fpath).stat().st_mtime > self._mtimes[fpath]
+        except OSError:
+            return False
+
+    def stale_files(self, fpaths: list[str]) -> list[str]:
+        """Return subset of fpaths that have been modified since last read."""
+        return [f for f in fpaths if self.needs_refresh(f)]
 
     def list_files(self) -> list[str]:
         """Return display-friendly list of tracked files."""

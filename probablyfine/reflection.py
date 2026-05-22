@@ -12,11 +12,21 @@ import time
 from rich.rule import Rule
 
 from probablyfine.agent import execute_plan
-from probablyfine.checker import run_checker
+from probablyfine.checker import MAX_DIFF_LINES, quick_sanity_check, run_checker
 from probablyfine.console import console
 from probablyfine.drm import get_manager as get_drm
-from probablyfine.checker import MAX_DIFF_LINES
-from probablyfine.models import EXIT_SIGINT, CheckerRequest, CheckerResult, ReflectionContext, ReflectionLog, ReflectionState, TaskPlan, TaskStep
+from probablyfine.models import (
+    CHECKER_HANG,
+    CHECKER_OOM,
+    EXIT_SIGINT,
+    CheckerRequest,
+    CheckerResult,
+    ReflectionContext,
+    ReflectionLog,
+    ReflectionState,
+    TaskPlan,
+    TaskStep,
+)
 from probablyfine.git_utils import get_head_sha as _get_head_sha
 from probablyfine.log_utils import get_module_logger
 from probablyfine.modes import Mode
@@ -306,6 +316,24 @@ def _run_checker_loop(
     # Track SHA before each repair for rollback safety
     pre_repair_sha = _get_head_sha()
 
+    # Pre-checker sanity filter: catch syntax errors before expensive LLM call
+    sanity_result = quick_sanity_check(ctx.files)
+    if sanity_result is not None:
+        _phase_rule("PRE-CHECK  syntax errors detected", style="bold red")
+        state.status = "failed"
+        state.history.append(sanity_result)
+        log.iterations.append({
+            "maker_model": ctx.maker_model,
+            "checker_model": "pre-checker",
+            "diff_lines": len(diff.strip().splitlines()),
+            "verdict": sanity_result.verdict,
+            "issues_count": len(sanity_result.issues),
+            "duration_s": 0.0,
+        })
+        log.final_verdict = "failed"
+        display_result(sanity_result, duration_s=0.0)
+        return
+
     for iteration in range(1, state.max_iterations + 1):
         state.status = "checking"
         state.iteration = iteration
@@ -344,6 +372,17 @@ def _run_checker_loop(
         })
 
         display_result(result, duration_s=iter_duration)
+
+        # -- Failure mode: skip remaining iterations on hang/OOM --
+        if result.failure_mode in (CHECKER_HANG, CHECKER_OOM):
+            log_reflect.warning("Checker failure mode: %s — skipping remaining iterations",
+                                result.failure_mode)
+            console.print(
+                f"  [check.warn]Checker {result.failure_mode} — skipping remaining iterations.[/check.warn]"
+            )
+            state.status = "passed"
+            log.final_verdict = f"PASS ({result.failure_mode})"
+            break
 
         # -- PASS: done --
         if result.verdict == "PASS":

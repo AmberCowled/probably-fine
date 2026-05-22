@@ -49,6 +49,7 @@ _CHECKPOINT_TIMEOUT_S = 10      # subprocess timeout for git operations
 _MAX_RECOVERY_ATTEMPTS = 1      # retries per failed step at plan level
 _MAX_EDITS_PER_FILE = 20        # Escalate to whole-file fallback above this
 _MAX_CONTINUATION_ROUNDS = 3    # Max multi-turn continuation rounds for capped edits
+_WHOLE_FILE_MAX_SIZE_KB = 10    # Skip Tier 3 for files larger than this (prevents hallucination)
 
 # Dynamic token budget per step type — avoids wasting tokens on simple steps
 # and prevents truncation on complex ones
@@ -62,9 +63,44 @@ _STEP_NUM_PREDICT: dict[str, int] = {
 }
 
 
-def _get_step_budget(action: str) -> int:
-    """Return num_predict token budget for a step action type."""
-    return _STEP_NUM_PREDICT.get(action, _AGENT_NUM_PREDICT)
+_CONTEXT_BUDGET_REF = 48000     # Reference context size (bytes) for scaling
+_BUDGET_SCALE_MIN = 0.5         # Minimum multiplier (small context)
+_BUDGET_SCALE_MAX = 2.0         # Maximum multiplier (large context + many files)
+
+
+def _get_step_budget(
+    action: str,
+    context_bytes: int = 0,
+    file_count: int = 1,
+) -> int:
+    """Return num_predict token budget for a step action type.
+
+    When context_bytes > 0, scales the base budget by context size and file count
+    to prevent truncation on large edits and waste on small ones.
+    """
+    base = _STEP_NUM_PREDICT.get(action, _AGENT_NUM_PREDICT)
+    if context_bytes <= 0:
+        return base
+    ctx_factor = context_bytes / _CONTEXT_BUDGET_REF  # 0..N
+    file_factor = min(file_count, 5) / 5              # 0..1
+    scale = 1.0 + ctx_factor * 0.5 + file_factor * 0.3
+    scale = max(_BUDGET_SCALE_MIN, min(_BUDGET_SCALE_MAX, scale))
+    adjusted = int(base * scale)
+    if abs(scale - 1.0) > 0.05:
+        log.debug("Token budget %s: %d -> %d (scale=%.2f, ctx=%d bytes, files=%d)",
+                  action, base, adjusted, scale, context_bytes, file_count)
+    return adjusted
+
+
+def _measure_context(files: list[str]) -> int:
+    """Return total byte size of context files (0 on any error)."""
+    total = 0
+    for f in files:
+        try:
+            total += Path(f).stat().st_size
+        except OSError:
+            pass
+    return total
 
 # ---------------------------------------------------------------------------
 # Misbehavior detection
@@ -149,6 +185,16 @@ FILE: path/to/file.py LINES 42-50
 replacement content
 >>>>>>> END
 
+- Unified diff format is also accepted (standard git diff output):
+
+--- a/path/to/file.py
++++ b/path/to/file.py
+@@ -10,3 +10,4 @@
+ context line
+-old line
++new line
++added line
+
 ## Guidelines
 
 - Make only the changes needed to complete the task
@@ -228,11 +274,11 @@ Complete the task using SEARCH/REPLACE blocks."""
 _RETRY_TEMPLATE = """\
 Step failed while editing {file}: {error}
 
-Here is the actual file content near the intended edit location:
 {nearby_content}
 
-What went wrong? Think through the problem, then provide corrected SEARCH/REPLACE blocks \
-using the exact content shown above."""
+{guidance}
+
+Provide corrected SEARCH/REPLACE blocks using the exact content shown above."""
 
 _CONTINUATION_TEMPLATE = """\
 {applied} edits were applied successfully. \
@@ -354,8 +400,14 @@ def _stream_response(
 # Message building
 # ---------------------------------------------------------------------------
 
+_file_mtimes: dict[str, float] = {}  # module-level mtime cache for staleness detection
+
+
 def _format_file_contents(files: list[str]) -> str:
-    """Read files and format as labeled blocks for the prompt."""
+    """Read files and format as labeled blocks for the prompt.
+
+    Tracks mtimes to detect stale context across multi-step plans.
+    """
     parts: list[str] = []
     for fpath in files:
         p = Path(fpath)
@@ -363,6 +415,10 @@ def _format_file_contents(files: list[str]) -> str:
             parts.append(f"### {fpath}\n(file not found)\n")
             continue
         try:
+            current_mtime = p.stat().st_mtime
+            if fpath in _file_mtimes and current_mtime > _file_mtimes[fpath]:
+                log.info("Re-reading stale file %s (modified since last read)", fpath)
+            _file_mtimes[fpath] = current_mtime
             content = p.read_text(errors="replace")
             parts.append(f"### {fpath}\n```\n{content}\n```\n")
         except OSError as e:
@@ -442,10 +498,14 @@ def _capture_diff(files_before: dict[str, str], changed_files: list[str]) -> str
     return "\n".join(diff_parts)
 
 
-def _get_nearby_content(file_path: str, search_text: str, context_lines: int = 5) -> str:
+def _get_nearby_content(file_path: str, search_text: str,
+                        error_type: str = "generic", context_lines: int = 5) -> str:
     """Get actual file content near where search_text was expected.
 
-    Used for retry prompts so the model sees what the file really contains.
+    Adapts output based on error_type:
+    - multi_match: show all match locations with line numbers
+    - not_found: show closest match via difflib
+    - generic: show region near best partial match
     """
     p = Path(file_path)
     if not p.exists():
@@ -459,7 +519,46 @@ def _get_nearby_content(file_path: str, search_text: str, context_lines: int = 5
     if not lines:
         return "(empty file)"
 
-    # Find the best matching region using the first non-empty line of search_text
+    # --- Multi-match: show all locations ---
+    if error_type == "multi_match" and search_text:
+        search_lines = search_text.splitlines()
+        first_line = ""
+        for sl in search_lines:
+            if sl.strip():
+                first_line = sl.strip()
+                break
+        if first_line:
+            match_locs: list[int] = []
+            for i, line in enumerate(lines):
+                if first_line in line:
+                    match_locs.append(i)
+            if len(match_locs) >= 2:
+                parts = [f"SEARCH text matches at {len(match_locs)} locations:"]
+                for loc_idx, li in enumerate(match_locs[:5], 1):
+                    start = max(0, li - 1)
+                    end = min(len(lines), li + len(search_lines) + 1)
+                    numbered = [f"{start + j + 1:4d} | {lines[start + j]}" for j in range(end - start)]
+                    parts.append(f"\n--- Match {loc_idx} (line {li + 1}) ---")
+                    parts.extend(numbered)
+                return "\n".join(parts)
+
+    # --- Not found: show closest match via difflib ---
+    if error_type == "not_found" and search_text:
+        search_stripped = [sl.strip() for sl in search_text.splitlines() if sl.strip()]
+        if search_stripped:
+            content_stripped = [l.strip() for l in lines]
+            matches = difflib.get_close_matches(search_stripped[0], content_stripped, n=1, cutoff=0.5)
+            if matches:
+                match_line = matches[0]
+                for i, l in enumerate(content_stripped):
+                    if l == match_line:
+                        start = max(0, i - context_lines)
+                        end = min(len(lines), i + context_lines + 1)
+                        numbered = [f"{start + j + 1:4d} | {lines[start + j]}" for j in range(end - start)]
+                        header = "Closest matching content in file:"
+                        return header + "\n" + "\n".join(numbered)
+
+    # --- Fallback: best partial match ---
     anchor = ""
     for line in search_text.splitlines():
         stripped = line.strip()
@@ -468,8 +567,7 @@ def _get_nearby_content(file_path: str, search_text: str, context_lines: int = 5
             break
 
     if not anchor:
-        # Return the first chunk of the file
-        return "\n".join(lines[:context_lines * 2])
+        return "File content (first lines):\n" + "\n".join(lines[:context_lines * 2])
 
     best_idx = 0
     best_score = 0
@@ -482,7 +580,7 @@ def _get_nearby_content(file_path: str, search_text: str, context_lines: int = 5
     start = max(0, best_idx - context_lines)
     end = min(len(lines), best_idx + context_lines + 1)
     numbered = [f"{start + i + 1:4d} | {line}" for i, line in enumerate(lines[start:end])]
-    return "\n".join(numbered)
+    return "File content near intended edit location:\n" + "\n".join(numbered)
 
 
 # ---------------------------------------------------------------------------
@@ -495,15 +593,35 @@ def _retry_with_error_context(
     failed_file: str,
     error_msg: str,
     search_text: str,
+    error_type: str = "generic",
 ) -> StepResult | None:
     """Tier 2: Retry a failed edit by sending error context back to the model."""
-    log.info("Tier 2 retry for %s: %s", failed_file, error_msg[:100])
-    nearby = _get_nearby_content(failed_file, search_text)
+    log.info("Tier 2 retry for %s (type=%s): %s", failed_file, error_type, error_msg[:100])
+    nearby = _get_nearby_content(failed_file, search_text, error_type=error_type)
+
+    _GUIDANCE = {
+        "multi_match": (
+            "Your SEARCH block matched multiple locations. "
+            "Include more surrounding context lines to make it unique — "
+            "copy lines exactly as shown above."
+        ),
+        "not_found": (
+            "Your SEARCH text does not exist in the file. "
+            "The closest matching content is shown above. "
+            "Copy the exact lines from the file — do not paraphrase or guess."
+        ),
+        "generic": (
+            "Think through what went wrong, then provide corrected "
+            "SEARCH/REPLACE blocks using the exact content shown above."
+        ),
+    }
+    guidance = _GUIDANCE.get(error_type, _GUIDANCE["generic"])
 
     retry_prompt = _RETRY_TEMPLATE.format(
         file=failed_file,
         error=error_msg,
         nearby_content=nearby,
+        guidance=guidance,
     )
 
     # Build minimal messages with /no_think for structured output
@@ -559,7 +677,17 @@ def _whole_file_fallback(
     failed_file: str,
 ) -> StepResult | None:
     """Tier 3: Ask the model for the complete updated file content."""
-    log.info("Tier 3 whole-file fallback for %s", failed_file)
+    max_kb = ctx.config.max_whole_file_size_kb or _WHOLE_FILE_MAX_SIZE_KB
+    try:
+        file_size_kb = Path(failed_file).stat().st_size / 1024
+    except OSError:
+        file_size_kb = 0
+    if file_size_kb > max_kb:
+        log.warning("Tier 3 skipped: %s too large (%.0f KB > %d KB limit)",
+                     failed_file, file_size_kb, max_kb)
+        return None
+
+    log.info("Tier 3 whole-file fallback for %s (%.0f KB)", failed_file, file_size_kb)
 
     prompt = _WHOLE_FILE_TEMPLATE.format(file=failed_file)
 
@@ -629,9 +757,11 @@ def _execute_edit(
 
     # --- Tier 1: primary attempt ---
     messages = _build_messages(step, files, ctx.plan, ctx.config, model=ctx.model)
+    ctx_bytes = _measure_context(files)
+    budget = _get_step_budget(step.action, context_bytes=ctx_bytes, file_count=len(files))
 
     try:
-        raw = _stream_response(ctx.model, messages, _get_step_budget(step.action), ctx.watchdog, ctx.on_token)
+        raw = _stream_response(ctx.model, messages, budget, ctx.watchdog, ctx.on_token)
     except _HangDetected:
         return _handle_hang(step, model, drm, start)
 
@@ -696,7 +826,7 @@ def _execute_edit(
                         {"role": "user", "content": cont_prompt + " /no_think"},
                     ]
                     try:
-                        cont_raw = _stream_response(ctx.model, cont_messages, _get_step_budget(step.action), ctx.watchdog, ctx.on_token)
+                        cont_raw = _stream_response(ctx.model, cont_messages, budget, ctx.watchdog, ctx.on_token)
                     except (_HangDetected, Exception) as e:
                         log.warning("Continuation round %d failed: %s", round_num + 1, e)
                         break
@@ -736,9 +866,10 @@ def _execute_edit(
     if errors:
         log.warning("Edit match rate: %d/%d passed validation",
                     len(edits) - len(errors), len(edits))
-        failed_edit, error_msg = errors[0]
+        failed_edit, error_msg, error_type = errors[0]
         result = _retry_with_error_context(
             step, ctx, failed_edit.file, error_msg, failed_edit.search,
+            error_type=error_type,
         )
         if result:
             result.duration_s = time.monotonic() - start
@@ -771,9 +902,11 @@ def _execute_explain(
         drm.ensure_loaded(ctx.model)
 
     messages = _build_messages(step, files, ctx.plan, ctx.config, model=ctx.model)
+    ctx_bytes = _measure_context(files)
+    budget = _get_step_budget(step.action, context_bytes=ctx_bytes, file_count=len(files))
 
     try:
-        raw = _stream_response(ctx.model, messages, _get_step_budget(step.action), ctx.watchdog, ctx.on_token)
+        raw = _stream_response(ctx.model, messages, budget, ctx.watchdog, ctx.on_token)
     except _HangDetected:
         return _handle_hang(step, model, drm, start)
 
@@ -992,28 +1125,112 @@ def _attempt_recovery(
     return None
 
 
-def _should_replan(step_result: StepResult, remaining_steps: list[TaskStep]) -> bool:
-    """Check if completed step changed files that remaining steps also target."""
+def _should_replan(
+    step_result: StepResult,
+    remaining_steps: list[TaskStep],
+    import_graph: dict[str, list[str]] | None = None,
+) -> bool:
+    """Check if completed step changed files that remaining steps also target.
+
+    When import_graph is provided, also triggers replan if a changed file has
+    >2 dependent files (high-impact change).
+    """
     if step_result.status != "ok" or not step_result.files_changed:
         return False
     changed = set(step_result.files_changed)
     for remaining in remaining_steps:
         if set(remaining.files) & changed:
             return True
+    # Import graph: replan if edited file has many dependents
+    if import_graph:
+        for f in step_result.files_changed:
+            deps = import_graph.get(f, [])
+            if len(deps) > 2:
+                log.info("Replan: %s has %d dependents in import graph", f, len(deps))
+                return True
     return False
 
 
-def _refresh_step_files(remaining_steps: list[TaskStep], changed_files: list[str],
-                        context: list[str]) -> None:
-    """Ensure changed files are in context so subsequent steps see current content."""
-    for f in changed_files:
+def _refresh_step_files(
+    remaining_steps: list[TaskStep],
+    changed_files: list[str],
+    context: list[str],
+    import_graph: dict[str, list[str]] | None = None,
+) -> None:
+    """Ensure changed files are in context so subsequent steps see current content.
+
+    When import_graph is provided, also adds dependent files to context.
+    """
+    files_to_add = list(changed_files)
+    if import_graph:
+        for f in changed_files:
+            for dep in import_graph.get(f, []):
+                if dep not in files_to_add:
+                    files_to_add.append(dep)
+        if len(files_to_add) > len(changed_files):
+            log.info("Import graph added %d dependent files to context",
+                     len(files_to_add) - len(changed_files))
+    for f in files_to_add:
         if f not in context:
             context.append(f)
-    log.info("Refreshed context with %d changed files for %d remaining steps",
-             len(changed_files), len(remaining_steps))
+    log.info("Refreshed context with %d files for %d remaining steps",
+             len(files_to_add), len(remaining_steps))
 
 
 _MAX_REPLANS = 1  # Cap replanning attempts per execution
+
+
+def _build_import_graph(files: list[str]) -> dict[str, list[str]]:
+    """Build a mapping of file -> list of files that import from it (dependents).
+
+    Uses ast to extract imports, then maps module names back to repo files.
+    Only considers Python files from the provided list.
+    """
+    py_files = [f for f in files if f.endswith(".py") and Path(f).exists()]
+    if len(py_files) < 2:
+        return {}
+
+    # Build module-name -> file mapping
+    mod_to_file: dict[str, str] = {}
+    for fpath in py_files:
+        mod = fpath.replace("\\", "/").replace("/", ".")
+        if mod.endswith(".py"):
+            mod = mod[:-3]
+        if mod.endswith(".__init__"):
+            mod = mod[:-9]
+        mod_to_file[mod] = fpath
+        # Also map basename: agent -> full path
+        parts = mod.split(".")
+        if len(parts) > 1:
+            mod_to_file[parts[-1]] = fpath
+
+    # Parse imports from each file, build dependents graph
+    dependents: dict[str, list[str]] = {}
+    for fpath in py_files:
+        try:
+            source = Path(fpath).read_text(errors="replace")
+            tree = ast.parse(source, filename=fpath)
+        except (SyntaxError, OSError):
+            continue
+        for node in ast.walk(tree):
+            mod_name = None
+            if isinstance(node, ast.ImportFrom) and node.module:
+                mod_name = node.module
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    mod_name = alias.name
+            if not mod_name:
+                continue
+            # Try full name, then last component
+            target = mod_to_file.get(mod_name) or mod_to_file.get(mod_name.split(".")[-1])
+            if target and target != fpath:
+                dependents.setdefault(target, [])
+                if fpath not in dependents[target]:
+                    dependents[target].append(fpath)
+
+    if dependents:
+        log.debug("Import graph: %d files have dependents", len(dependents))
+    return dependents
 
 
 def _verify_cross_file_consistency(changed_files: list[str]) -> list[str]:
@@ -1198,10 +1415,13 @@ def execute_plan(
             if f not in initial_files:
                 initial_files.append(f)
 
-    # 3. Snapshot files before any changes
+    # 3. Build import graph for dependency-aware replanning
+    import_graph = _build_import_graph(initial_files)
+
+    # 4. Snapshot files before any changes
     files_before = _snapshot_files(initial_files)
 
-    # 4. Sort steps in dependency order
+    # 5. Sort steps in dependency order
     ordered = _topological_sort(plan.steps)
     total = len(ordered)
 
@@ -1293,8 +1513,8 @@ def execute_plan(
             # Refresh context if this step changed files targeted by later steps
             step_idx = ordered.index(step)
             remaining = ordered[step_idx + 1:]
-            if _should_replan(result, remaining):
-                _refresh_step_files(remaining, result.files_changed, context)
+            if _should_replan(result, remaining, import_graph):
+                _refresh_step_files(remaining, result.files_changed, context, import_graph)
 
         # Handle failure with recovery
         if result.status == "failed" and step.action in ("edit", "create", "explain"):

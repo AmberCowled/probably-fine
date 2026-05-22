@@ -7,6 +7,7 @@ is unavailable.
 
 from __future__ import annotations
 
+import ast
 import os
 import re
 import subprocess
@@ -251,6 +252,88 @@ def _filter_by_budget(
     return kept
 
 
+_MAX_IMPORT_CHAIN_FILES = 20  # Cap total files from import chain following
+
+
+def _extract_imports(fpath: str) -> list[str]:
+    """Extract imported module names from a Python file via ast."""
+    try:
+        source = Path(fpath).read_text(errors="replace")
+        tree = ast.parse(source, filename=fpath)
+    except (SyntaxError, OSError):
+        return []
+
+    modules: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                modules.append(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                modules.append(node.module)
+    return modules
+
+
+def _follow_import_chain(
+    git_files: list[str],
+    seed_files: list[str],
+    max_depth: int = 1,
+) -> list[str]:
+    """Follow import chains from seed files to discover additional relevant files.
+
+    Uses ast to extract imports, then maps module paths back to repo files.
+    BFS to max_depth, capped at _MAX_IMPORT_CHAIN_FILES total.
+    """
+    # Build module-to-file mapping from git files
+    module_map: dict[str, str] = {}
+    for gf in git_files:
+        if not gf.endswith(".py"):
+            continue
+        # Convert path to dotted module: probablyfine/agent.py -> probablyfine.agent
+        mod = gf.replace("/", ".").replace("\\", ".")
+        if mod.endswith(".py"):
+            mod = mod[:-3]
+        if mod.endswith(".__init__"):
+            mod = mod[:-9]
+        module_map[mod] = gf
+        # Also map the basename: agent -> probablyfine/agent.py (for relative imports)
+        parts = mod.split(".")
+        if len(parts) > 1:
+            module_map[parts[-1]] = gf
+
+    seed_set = set(seed_files)
+    discovered: list[str] = []
+    visited: set[str] = set(seed_files)
+    queue = list(seed_files)
+
+    for _depth in range(max_depth):
+        next_queue: list[str] = []
+        for fpath in queue:
+            if not fpath.endswith(".py"):
+                continue
+            imports = _extract_imports(fpath)
+            for mod_name in imports:
+                # Try full module name, then progressively shorter prefixes
+                matched = module_map.get(mod_name)
+                if not matched:
+                    # Try last component: probablyfine.models -> models
+                    short = mod_name.split(".")[-1]
+                    matched = module_map.get(short)
+                if matched and matched not in visited:
+                    visited.add(matched)
+                    discovered.append(matched)
+                    next_queue.append(matched)
+                    if len(discovered) >= _MAX_IMPORT_CHAIN_FILES:
+                        log.info("Import chain cap reached (%d files)", len(discovered))
+                        return discovered
+        queue = next_queue
+
+    if discovered:
+        log.info("Import chain discovered %d additional files: %s",
+                 len(discovered), discovered[:5])
+    return discovered
+
+
 def select_files(
     task: str,
     model: str,
@@ -285,6 +368,12 @@ def select_files(
 
     if not selected:
         return existing_files
+
+    # Follow import chains from selected files to discover dependencies
+    import_files = _follow_import_chain(git_files, selected)
+    for f in import_files:
+        if f not in selected:
+            selected.append(f)
 
     # Convert to absolute paths (matching FileContext convention)
     cwd = Path.cwd()
